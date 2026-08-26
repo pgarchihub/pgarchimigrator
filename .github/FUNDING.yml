@@ -1,0 +1,9 @@
+# Enables the "Sponsor" button on this repository's GitHub page.
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+#
+# This alone does not activate sponsorship — the "pgarchihub" GitHub
+# account/organization must also separately enable GitHub Sponsors under
+# its own account settings (Settings -> Sponsorships) before this button
+# does anything. If that hasn't been done yet, the button either won't
+# appear or will link to an inactive page.
+github: [pgarchihub]

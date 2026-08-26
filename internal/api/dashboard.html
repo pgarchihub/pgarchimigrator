@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pgArchiMigrator</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; max-width: 960px; }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1.1rem; margin-top: 2rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: 0.5rem; }
+  th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #8884; font-size: 0.9rem; }
+  .phase { font-family: monospace; }
+  .phase-COMPLETED { color: #2a7; }
+  .phase-FAILED { color: #d33; }
+  .phase-ABORTED { color: #a80; }
+  .bar { background: #8882; border-radius: 3px; height: 8px; width: 120px; overflow: hidden; display: inline-block; vertical-align: middle; }
+  .bar-fill { background: #2a7; height: 100%; }
+  form { display: grid; grid-template-columns: repeat(2, minmax(200px, 1fr)); gap: 0.5rem; max-width: 640px; }
+  label { font-size: 0.85rem; display: flex; flex-direction: column; gap: 0.2rem; }
+  input, select { padding: 0.35rem; font-size: 0.9rem; }
+  button { padding: 0.4rem 0.8rem; cursor: pointer; }
+  .actions { display: flex; gap: 0.5rem; align-items: center; margin: 0.75rem 0; }
+  #formMsg, #sweepMsg, #loginMsg, #userMsg { font-size: 0.85rem; margin-top: 0.4rem; }
+  .err { color: #d33; }
+  .ok { color: #2a7; }
+  .topbar { display: flex; justify-content: space-between; align-items: baseline; }
+  #whoami { font-size: 0.85rem; opacity: 0.8; }
+  #loginScreen { max-width: 320px; margin: 4rem auto; }
+  #loginScreen form { grid-template-columns: 1fr; }
+</style>
+</head>
+<body>
+
+  <div id="loginScreen">
+    <h1>pgArchiMigrator</h1>
+    <form id="loginForm">
+      <input name="email" type="email" placeholder="Email" required autocomplete="username">
+      <input name="password" type="password" placeholder="Password" required autocomplete="current-password">
+      <div><button type="submit">Log in</button></div>
+    </form>
+    <div id="loginMsg"></div>
+  </div>
+
+  <div id="appScreen" style="display:none">
+    <div class="topbar">
+      <h1>pgArchiMigrator</h1>
+      <div>
+        <span id="whoami"></span>
+        · <button id="logoutBtn">Log out</button>
+      </div>
+    </div>
+    <p>Zero-downtime PostgreSQL schema migrations — see Architecture Doc Section 5.</p>
+
+    <div class="actions">
+      <button id="refreshBtn">Refresh now</button>
+      <button id="sweepBtn">Run sweep</button>
+      <span id="sweepMsg"></span>
+    </div>
+
+    <h2>Jobs</h2>
+    <table id="jobsTable">
+      <thead>
+        <tr><th>ID</th><th>Table</th><th>Strategy</th><th>Phase</th><th>Progress</th><th></th></tr>
+      </thead>
+      <tbody id="jobsBody"><tr><td colspan="6">Loading…</td></tr></tbody>
+    </table>
+
+    <h2 id="migrateHeading">Start a migration</h2>
+    <form id="migrateForm">
+      <label>Schema <input name="schema" placeholder="public"></label>
+      <label>Table <input name="table" required></label>
+      <label>Column <input name="column" required></label>
+      <label>Operation
+        <select name="operation">
+          <option value="ADD_COLUMN">ADD_COLUMN</option>
+          <option value="DROP_COLUMN">DROP_COLUMN</option>
+          <option value="ALTER_COLUMN_TYPE">ALTER_COLUMN_TYPE</option>
+          <option value="ADD_INDEX">ADD_INDEX</option>
+          <option value="DROP_INDEX">DROP_INDEX</option>
+          <option value="SET_NOT_NULL">SET_NOT_NULL</option>
+          <option value="ADD_CONSTRAINT">ADD_CONSTRAINT</option>
+          <option value="RENAME_COLUMN">RENAME_COLUMN</option>
+        </select>
+      </label>
+      <label>Index name <input name="index_name" placeholder="optional for ADD_INDEX, required for DROP_INDEX"></label>
+      <label>Constraint name <input name="constraint_name" placeholder="optional for SET_NOT_NULL, required for ADD_CONSTRAINT"></label>
+      <label>Check expression <input name="check_expression" placeholder="e.g. price &gt; 0 (ADD_CONSTRAINT only)"></label>
+      <label>New column name <input name="new_column_name" placeholder="required for RENAME_COLUMN"></label>
+      <label>Type <input name="type" placeholder="e.g. integer, text"></label>
+      <label>Default <input name="default" placeholder="e.g. 'active' or now()"></label>
+      <label><input type="checkbox" name="volatile_default"> Volatile default</label>
+      <label>Strategy override
+        <select name="strategy_override">
+          <option value="">(automatic)</option>
+          <option value="DIRECT_DDL">DIRECT_DDL</option>
+          <option value="EXPAND_BACKFILL">EXPAND_BACKFILL</option>
+          <option value="SHADOW_TABLE">SHADOW_TABLE</option>
+        </select>
+      </label>
+      <div>
+        <button type="button" id="previewBtn">Preview (dry run)</button>
+        <button type="submit">Start migration</button>
+      </div>
+    </form>
+    <div id="formMsg"></div>
+    <div id="previewResult" style="display:none; margin-top: 0.75rem; padding: 0.75rem; border: 1px solid #8884; border-radius: 6px; font-size: 0.85rem;"></div>
+
+    <div id="usersSection" style="display:none">
+      <h2>Users</h2>
+      <table id="usersTable">
+        <thead><tr><th>Email</th><th>Role</th><th></th></tr></thead>
+        <tbody id="usersBody"></tbody>
+      </table>
+      <form id="addUserForm">
+        <label>Email <input name="email" type="email" required></label>
+        <label>Password <input name="password" type="password" required></label>
+        <label>Role
+          <select name="role">
+            <option value="viewer">viewer</option>
+            <option value="operator">operator</option>
+            <option value="admin">admin</option>
+          </select>
+        </label>
+        <div><button type="submit">Add user</button></div>
+      </form>
+      <div id="userMsg"></div>
+    </div>
+  </div>
+
+<script>
+let currentUser = null;
+
+async function checkAuth() {
+  try {
+    const res = await fetch('/api/auth/me', { credentials: 'same-origin' });
+    if (res.ok) {
+      currentUser = await res.json();
+      showApp();
+    } else {
+      showLogin();
+    }
+  } catch (e) {
+    showLogin();
+  }
+}
+
+function showLogin() {
+  currentUser = null;
+  document.getElementById('loginScreen').style.display = '';
+  document.getElementById('appScreen').style.display = 'none';
+}
+
+function showApp() {
+  document.getElementById('loginScreen').style.display = 'none';
+  document.getElementById('appScreen').style.display = '';
+  document.getElementById('whoami').textContent = currentUser.email + ' (' + currentUser.role + ')';
+  applyRoleVisibility();
+  fetchJobs();
+  if (currentUser.role === 'admin') fetchUsers();
+}
+
+function applyRoleVisibility() {
+  const isOperator = currentUser.role === 'operator' || currentUser.role === 'admin';
+  const isAdmin = currentUser.role === 'admin';
+  document.getElementById('migrateHeading').style.display = isOperator ? '' : 'none';
+  document.getElementById('migrateForm').style.display = isOperator ? '' : 'none';
+  document.getElementById('sweepBtn').style.display = isAdmin ? '' : 'none';
+  document.getElementById('usersSection').style.display = isAdmin ? '' : 'none';
+}
+
+// handleUnauthorized returns true (and shows the login screen) if the
+// response indicates the session is no longer valid — e.g. it expired
+// while this page was left open across a 3-second poll tick.
+function handleUnauthorized(res) {
+  if (res.status === 401) {
+    showLogin();
+    return true;
+  }
+  return false;
+}
+
+async function fetchJobs() {
+  const res = await fetch('/api/migrations', { credentials: 'same-origin' });
+  if (handleUnauthorized(res)) return;
+  const jobs = await res.json();
+  const body = document.getElementById('jobsBody');
+  if (!jobs || jobs.length === 0) {
+    body.innerHTML = '<tr><td colspan="6">No jobs yet.</td></tr>';
+    return;
+  }
+  body.innerHTML = jobs.map(renderRow).join('');
+  body.querySelectorAll('button.rollback').forEach(btn => {
+    btn.addEventListener('click', () => rollback(btn.dataset.id));
+  });
+}
+
+function renderRow(job) {
+  const pct = Math.round(job.PercentComplete || (job.Terminal && !job.Failed ? 100 : 0));
+  const canRollback = job.CurrentPhase === 'ROLLBACK_WINDOW' &&
+    (currentUser.role === 'operator' || currentUser.role === 'admin');
+  const table = (job.SchemaName || '') + '.' + (job.TableName || '');
+  return `<tr>
+    <td><code title="${job.JobID}">${job.JobID.slice(0, 24)}…</code></td>
+    <td>${escapeHtml(table)}</td>
+    <td>${escapeHtml(job.Strategy || '')}</td>
+    <td class="phase phase-${job.CurrentPhase}">${job.CurrentPhase}</td>
+    <td><span class="bar"><span class="bar-fill" style="width:${pct}%"></span></span> ${pct}%</td>
+    <td>${canRollback ? `<button class="rollback" data-id="${job.JobID}">Rollback</button>` : ''}</td>
+  </tr>`;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function rollback(id) {
+  if (!confirm('Roll back job ' + id + '?')) return;
+  const res = await fetch(`/api/migrations/${encodeURIComponent(id)}/rollback`, { method: 'POST', credentials: 'same-origin' });
+  if (handleUnauthorized(res)) return;
+  await res.json();
+  fetchJobs();
+}
+
+async function fetchUsers() {
+  const res = await fetch('/api/users', { credentials: 'same-origin' });
+  if (handleUnauthorized(res)) return;
+  if (!res.ok) return;
+  const list = await res.json();
+  const body = document.getElementById('usersBody');
+  body.innerHTML = list.map(u => `<tr>
+    <td>${escapeHtml(u.email)}</td>
+    <td>${escapeHtml(u.role)}</td>
+    <td>${u.id !== currentUser.id ? `<button class="deleteUser" data-id="${u.id}">Delete</button>` : '(you)'}</td>
+  </tr>`).join('');
+  body.querySelectorAll('button.deleteUser').forEach(btn => {
+    btn.addEventListener('click', () => deleteUser(btn.dataset.id));
+  });
+}
+
+async function deleteUser(id) {
+  if (!confirm('Delete this user?')) return;
+  const res = await fetch(`/api/users/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'same-origin' });
+  if (handleUnauthorized(res)) return;
+  fetchUsers();
+}
+
+document.getElementById('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const msg = document.getElementById('loginMsg');
+  msg.textContent = 'Logging in…';
+  msg.className = '';
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ email: form.email.value, password: form.password.value }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      currentUser = data;
+      msg.textContent = '';
+      form.reset();
+      showApp();
+    } else {
+      msg.textContent = 'Error: ' + (data.error || 'login failed');
+      msg.className = 'err';
+    }
+  } catch (err) {
+    msg.textContent = 'Error: ' + err;
+    msg.className = 'err';
+  }
+});
+
+document.getElementById('logoutBtn').addEventListener('click', async () => {
+  await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+  showLogin();
+});
+
+document.getElementById('refreshBtn').addEventListener('click', fetchJobs);
+
+document.getElementById('sweepBtn').addEventListener('click', async () => {
+  const msg = document.getElementById('sweepMsg');
+  msg.textContent = 'Running…';
+  msg.className = '';
+  try {
+    const res = await fetch('/api/sweep', { method: 'POST', credentials: 'same-origin' });
+    if (handleUnauthorized(res)) return;
+    const data = await res.json();
+    if (res.ok) {
+      msg.textContent = `OK — scanned ${data.scan?.JobsScanned ?? 0}, swept ${data.sweep?.JobsSwept ?? 0}`;
+      msg.className = 'ok';
+    } else {
+      msg.textContent = 'Error: ' + (data.error || data.scan_error || data.sweep_error || 'unknown');
+      msg.className = 'err';
+    }
+  } catch (e) {
+    msg.textContent = 'Error: ' + e;
+    msg.className = 'err';
+  }
+  fetchJobs();
+});
+
+function buildMigrationBody(form) {
+  return {
+    schema: form.schema.value,
+    table: form.table.value,
+    column: form.column.value,
+    operation: form.operation.value,
+    type: form.type.value,
+    default: form.default.value,
+    volatile_default: form.volatile_default.checked,
+    strategy_override: form.strategy_override.value,
+    index_name: form.index_name.value,
+    constraint_name: form.constraint_name.value,
+    check_expression: form.check_expression.value,
+    new_column_name: form.new_column_name.value,
+  };
+}
+
+document.getElementById('previewBtn').addEventListener('click', async () => {
+  const form = document.getElementById('migrateForm');
+  const resultBox = document.getElementById('previewResult');
+  resultBox.style.display = '';
+  resultBox.textContent = 'Generating preview…';
+  try {
+    const res = await fetch('/api/migrations/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(buildMigrationBody(form)),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      resultBox.innerHTML = '<strong>Error:</strong> ' + escapeHtml(data.error || 'preview failed');
+      return;
+    }
+    let html = `<strong>Strategy:</strong> ${escapeHtml(data.Strategy)} (~${data.EstimatedRows} estimated row(s))<br>`;
+    if (data.Statements && data.Statements.length) {
+      html += '<strong>Statements that would run:</strong><ol style="margin:0.3rem 0 0.5rem 1.2rem;padding:0">' +
+        data.Statements.map(s => `<li><code>${escapeHtml(s)}</code></li>`).join('') + '</ol>';
+    }
+    if (data.Warnings && data.Warnings.length) {
+      html += '<strong class="err">Warnings:</strong><ul style="margin:0.3rem 0 0.5rem 1.2rem;padding:0">' +
+        data.Warnings.map(w => `<li class="err">${escapeHtml(w)}</li>`).join('') + '</ul>';
+    }
+    if (data.Notes && data.Notes.length) {
+      html += '<strong>Notes:</strong><ul style="margin:0.3rem 0 0;padding:0 0 0 1.2rem">' +
+        data.Notes.map(n => `<li>${escapeHtml(n)}</li>`).join('') + '</ul>';
+    }
+    html += '<div style="margin-top:0.5rem;opacity:0.7">No changes were made — this was a dry run.</div>';
+    resultBox.innerHTML = html;
+  } catch (err) {
+    resultBox.innerHTML = '<strong>Error:</strong> ' + escapeHtml(String(err));
+  }
+});
+
+document.getElementById('migrateForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const body = buildMigrationBody(form);
+  const msg = document.getElementById('formMsg');
+  msg.textContent = 'Submitting…';
+  msg.className = '';
+  try {
+    const res = await fetch('/api/migrations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(body),
+    });
+    if (handleUnauthorized(res)) return;
+    const data = await res.json();
+    if (res.ok) {
+      msg.textContent = 'Started: ' + data.JobID + ' (' + data.CurrentPhase + ')';
+      msg.className = 'ok';
+    } else {
+      msg.textContent = 'Error: ' + (data.error || JSON.stringify(data));
+      msg.className = 'err';
+    }
+  } catch (err) {
+    msg.textContent = 'Error: ' + err;
+    msg.className = 'err';
+  }
+  fetchJobs();
+});
+
+document.getElementById('addUserForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const msg = document.getElementById('userMsg');
+  msg.textContent = 'Creating…';
+  msg.className = '';
+  try {
+    const res = await fetch('/api/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ email: form.email.value, password: form.password.value, role: form.role.value }),
+    });
+    if (handleUnauthorized(res)) return;
+    const data = await res.json();
+    if (res.ok) {
+      msg.textContent = 'User created: ' + data.email;
+      msg.className = 'ok';
+      form.reset();
+      fetchUsers();
+    } else {
+      msg.textContent = 'Error: ' + (data.error || 'failed');
+      msg.className = 'err';
+    }
+  } catch (err) {
+    msg.textContent = 'Error: ' + err;
+    msg.className = 'err';
+  }
+});
+
+checkAuth();
+setInterval(() => { if (currentUser) fetchJobs(); }, 3000);
+</script>
+</body>
+</html>

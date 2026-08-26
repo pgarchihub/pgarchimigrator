@@ -1,0 +1,24 @@
+apiVersion: v2
+name: pgarchimigrator
+description: >-
+  Zero-downtime PostgreSQL schema migration tool (Architecture Doc Section
+  5: "Docker containerlar ve Kubernetes Helm Charts olarak paketleme").
+  Deploys the REST API + dashboard server (`pgarchimigrator serve`) as a
+  single-replica StatefulSet with persistent state storage.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - postgresql
+  - database-migration
+  - zero-downtime
+home: https://github.com/pgarchihub/pgarchimigrator
+# NOTE: this URL doesn't resolve to a real image yet — no logo has been
+# created for this project. It's set to the path a real icon WOULD live
+# at once one exists and is committed (matching the `home` repo above),
+# purely so `helm lint`'s "icon is recommended" notice is satisfied with a
+# real, forward-compatible value rather than a throwaway placeholder.
+# Replace with an actual hosted image URL (SVG or PNG) once a logo exists.
+icon: https://raw.githubusercontent.com/pgarchihub/pgarchimigrator/main/docs/icon.png
+maintainers:
+  - name: Dataiotech

@@ -1,0 +1,34 @@
+# Local state — these are per-deployment data files, never source. A
+# fresh `git clone` should never accidentally ship someone else's
+# migration history, user accounts, or audit trail.
+pgarchimigrator-state.db
+pgarchimigrator-auth.db
+pgarchimigrator-state.db-journal
+pgarchimigrator-auth.db-journal
+*.db-shm
+*.db-wal
+pgarchimigrator-audit.jsonl
+
+# Secrets / environment — PGARCHIMIGRATOR_DATABASE_URL and any other
+# credentials belong in the deployment environment (systemd unit,
+# Kubernetes Secret, .env loaded by a process manager), never in a
+# committed file.
+.env
+.env.local
+.env.*.local
+
+# Build artifacts
+/bin/
+web/node_modules/
+web/dist/
+# internal/api/webapp/ is deliberately NOT ignored — it's a committed
+# snapshot of the built frontend, kept in sync manually (see its own
+# doc comment in internal/api/server.go), so plain `go build`/`go run`
+# works without requiring a Node toolchain. Only Docker builds
+# regenerate it fresh (see the Dockerfile's webbuild stage).
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

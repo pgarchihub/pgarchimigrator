@@ -1,0 +1,167 @@
+name: Migration Preview
+
+# Runs "preview-file" (see docs/migration-as-code.md) against every
+# migration JSON file this PR adds or changes under migrations/, and
+# posts the result — the exact SQL, chosen strategy, and any warnings
+# for each one — as a PR comment. This is what makes "Migration as Code"
+# (see internal/migrationfile's own package doc comment) actually useful
+# for review: a reviewer sees the real impact of a schema change without
+# needing to run anything locally.
+#
+# Deliberately only reads (preview-file never calls StartMigration — see
+# that command's own doc comment) — nothing here can modify the schema
+# it runs against, which is why this workflow is safe to run
+# automatically on every PR from a fork, not just ones from trusted
+# contributors.
+#
+# Note for adopters: this workflow assumes YOUR repository keeps its own
+# migration files under migrations/ at the repo root (see
+# docs/migration-as-code.md's "Directory convention") and that a
+# PostgreSQL instance is reachable — adjust the postgres: service block
+# and PGARCHIMIGRATOR_DATABASE_URL below to point at whatever ephemeral
+# database your own CI provisions. This repository has no migrations/
+# directory of its own yet (examples/migrations/ holds sample files for
+# documentation only, deliberately NOT under migrations/, so this
+# workflow's own CI run on this repository has nothing to preview until
+# you add real migrations under migrations/).
+
+on:
+  pull_request:
+    paths:
+      - "migrations/**.json"
+
+permissions:
+  contents: read
+  pull-requests: write # needed to post/update the preview comment
+
+concurrency:
+  group: migration-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    name: Preview changed migrations
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pgarchimigrator
+          POSTGRES_PASSWORD: pgarchimigrator_ci_only
+          POSTGRES_DB: pgarchimigrator_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pgarchimigrator"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGARCHIMIGRATOR_DATABASE_URL: "postgresql://pgarchimigrator:pgarchimigrator_ci_only@localhost:5432/pgarchimigrator_ci?sslmode=disable"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, not just the merge commit — needed for the git
+          # diff below to correctly resolve the PR's base commit.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build the CLI
+        run: go build -o pgarchimigrator-cli ./cmd/pgarchimigrator
+
+      - name: Find changed migration files
+        id: changed
+        # Plain git diff rather than a third-party "changed files" action
+        # — deliberately avoids adding a supply-chain dependency (many
+        # real-world CI compromises have come through exactly this kind
+        # of small, easy-to-overlook third-party action) for something a
+        # single, auditable shell command already does.
+        run: |
+          FILES=$(git diff --name-only --diff-filter=ACM "origin/${{ github.base_ref }}...HEAD" -- 'migrations/*.json')
+          echo "Changed migration files:"
+          echo "$FILES"
+          # Multiline output needs GitHub's heredoc-style delimiter syntax.
+          {
+            echo "files<<PGAM_EOF"
+            echo "$FILES"
+            echo "PGAM_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Preview changed migrations
+        id: preview
+        if: steps.changed.outputs.files != ''
+        run: |
+          mkdir -p /tmp/pgam-preview-batch
+          # preview-file --dir expects a flat directory of the files to
+          # preview — copying just the CHANGED ones there (rather than
+          # pointing --dir at the full migrations/ directory) means this
+          # only ever previews what THIS PR actually touches, not every
+          # migration the project has ever accumulated (most of which
+          # are presumably already applied elsewhere and would preview
+          # confusingly — e.g. "column already exists" — against this
+          # workflow's own fresh, empty database).
+          while IFS= read -r f; do
+            [ -n "$f" ] && cp "$f" /tmp/pgam-preview-batch/
+          done <<< "${{ steps.changed.outputs.files }}"
+
+          OUTPUT_FILE=/tmp/pgam-preview-output.txt
+          if ! ./pgarchimigrator-cli preview-file \
+              --dir /tmp/pgam-preview-batch \
+              --state-db /tmp/pgam-preview-state.db \
+              > "$OUTPUT_FILE" 2>&1; then
+            echo "preview-file exited non-zero — see output above/below"
+            cat "$OUTPUT_FILE"
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post preview as a PR comment
+        if: steps.changed.outputs.files != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const outputPath = '/tmp/pgam-preview-output.txt';
+            const output = fs.existsSync(outputPath)
+              ? fs.readFileSync(outputPath, 'utf8')
+              : '(no output captured)';
+
+            // Truncate defensively — a GitHub comment body has a real
+            // size limit, and a very large migration batch's full SQL
+            // dump could theoretically approach it.
+            const MAX_LEN = 60000;
+            const body = output.length > MAX_LEN
+              ? output.slice(0, MAX_LEN) + '\n\n... (truncated)'
+              : output;
+
+            const marker = '<!-- pgarchimigrator-migration-preview -->';
+            const commentBody = `${marker}\n### 🔍 Migration preview\n\n\`\`\`\n${body}\n\`\`\``;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            // Update the existing preview comment (if this workflow has
+            // already commented on this PR before, e.g. after a new
+            // push) rather than piling up a new comment on every push —
+            // keeps the PR thread readable.
+            const existing = comments.find((c) => c.body.startsWith(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: commentBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody,
+              });
+            }

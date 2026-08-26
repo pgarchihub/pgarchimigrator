@@ -1,0 +1,34 @@
+# Keep the build context small and avoid leaking local secrets/state into
+# the image or slowing down `docker build`'s context upload.
+.git
+.gitignore
+*.md
+!README.md
+
+# Local dev artifacts — never meant to end up in an image.
+pgarchimigrator-state.db
+pgarchimigrator-audit.jsonl
+.env.local
+bin/
+
+# Deployment manifests are applied separately (kubectl/helm), not baked
+# into the application image.
+deploy/
+
+# Editor/OS cruft.
+.vscode/
+.idea/
+.DS_Store
+
+# CI configuration — never needed inside the built image.
+.github/
+
+# Frontend build artifacts — rebuilt fresh inside the Dockerfile's webbuild
+# stage every time (see its comment), so the host's node_modules (which
+# may contain platform-specific native binaries from whatever OS `npm
+# install` was last run on locally) must never be copied into the build
+# context. web/dist is also excluded for the same reason: internal/api/webapp/
+# (the committed snapshot used by plain `go build`) is intentionally NOT
+# excluded here, since that one IS meant to ship for non-Docker builds.
+web/node_modules/
+web/dist/

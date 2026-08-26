@@ -1,0 +1,82 @@
+# Default values for pgarchimigrator.
+# See README.md in this chart for a full explanation of each setting.
+
+image:
+  repository: ghcr.io/pgarchihub/pgarchimigrator
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+
+# IMPORTANT (TR-13): replicas is intentionally NOT exposed as a
+# configurable value here — see templates/statefulset.yaml, where it is
+# hardcoded to 1. pgArchiMigrator's state store is single-instance only;
+# scaling this workload out would corrupt or split-brain the SQLite-backed
+# checkpoint database.
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# Persistent storage for the SQLite state database and JSON Lines audit
+# log (both under /data in the container). This MUST survive pod
+# restarts/rescheduling — losing it means internal/reaper can no longer
+# find and clean up in-flight migrations' PostgreSQL-side resources
+# (replication slots, shadow tables), and in-progress jobs become
+# unrecoverable orphans.
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClassName: "" # empty means "use the cluster's default StorageClass"
+  accessMode: ReadWriteOnce
+
+# The DSN pgArchiMigrator connects to PostgreSQL with (PGARCHIMIGRATOR_DATABASE_URL,
+# see Requirements Doc TR-05 — this must never be set directly in
+# values.yaml if that file might be committed to version control).
+#
+# Preferred: reference an existing Secret you created out-of-band, e.g.:
+#   kubectl create secret generic pgarchimigrator-db-credentials \
+#     --from-literal=database-url='postgresql://user:pass@host:5432/db?sslmode=require'
+database:
+  existingSecret:
+    name: "" # e.g. "pgarchimigrator-db-credentials"
+    key: "database-url"
+  # Only used if existingSecret.name is empty. Do NOT commit a real DSN
+  # here — this exists for quick local/throwaway testing only.
+  inlineDSN: ""
+
+# Passed through as PGARCHIMIGRATOR_ACTOR — identifies this deployment's actions
+# in the audit log (TR-07) rather than falling back to the container's OS
+# username, which is meaningless in Kubernetes.
+actor: "k8s-deployment"
+
+# Corresponds to `pgarchimigrator serve --auto-sweep` (default true): runs
+# internal/reaper's periodic orphan-cleanup + rollback-window-completion
+# loop in the background alongside the API server.
+autoSweep: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  fsGroup: 65532 # matches distroless/static's built-in "nonroot" UID/GID
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

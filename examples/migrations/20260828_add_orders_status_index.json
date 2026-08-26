@@ -1,0 +1,8 @@
+{
+  "id": "20260828_add_orders_status_index",
+  "description": "Speed up the fulfillment dashboard's status filter",
+  "schema": "public",
+  "table": "orders",
+  "operation": "ADD_INDEX",
+  "column": "status"
+}

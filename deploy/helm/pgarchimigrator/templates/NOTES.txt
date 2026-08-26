@@ -1,0 +1,43 @@
+pgArchiMigrator has been deployed as a single-replica StatefulSet
+(release: {{ .Release.Name }}, namespace: {{ .Release.Namespace }}).
+
+{{- if not .Values.database.existingSecret.name }}
+
+WARNING: no database.existingSecret was configured, so this release
+created its own Secret from database.inlineDSN. If that value ended up in
+a committed values file or your shell history, rotate the PostgreSQL
+credentials it contains and switch to database.existingSecret instead.
+{{- end }}
+
+1. Check that the pod became Ready:
+
+   kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }}
+
+2. Access the dashboard (a React SPA served at /app — the root path
+   redirects there) + REST API:
+
+{{- if eq .Values.service.type "ClusterIP" }}
+
+   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "pgarchimigrator.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+
+   Then open http://localhost:{{ .Values.service.port }}/
+{{- else if eq .Values.service.type "LoadBalancer" }}
+
+   kubectl get svc -n {{ .Release.Namespace }} {{ include "pgarchimigrator.fullname" . }}
+
+   (wait for EXTERNAL-IP, then open http://<EXTERNAL-IP>:{{ .Values.service.port }}/)
+{{- else }}
+
+   kubectl get svc -n {{ .Release.Namespace }} {{ include "pgarchimigrator.fullname" . }}
+{{- end }}
+
+3. Reminder (TR-13): this workload is single-instance by design. Do not
+   attempt to scale it — `kubectl scale statefulset {{ include "pgarchimigrator.fullname" . }} --replicas=2`
+   will not work as expected and risks corrupting the SQLite-backed state
+   store shared conceptually by the migration jobs it tracks.
+
+4. Persistent state lives on the StatefulSet's PVC
+   (data-{{ include "pgarchimigrator.fullname" . }}-0). Back this volume
+   up like you would any other stateful workload's data — losing it means
+   internal/reaper can no longer find and clean up any migrations that
+   were in flight.

@@ -1,0 +1,62 @@
+# Architecture Doc Section 9 "Test Environment Setup":
+#   - pg-logical: wal_level=logical enabled, for happy-path tests.
+#   - pg-legacy:  wal_level=replica (disabled), for the preflight-failure scenario (US-05).
+#   - pg-nopk:    logical enabled, used in tests to create a table without a PK to verify the 3.2 constraint.
+#
+# PGARCHIMIGRATOR_TEST_PG_VERSION overrides both services' PostgreSQL
+# major version (defaults to 16, unchanged local-dev behavior if unset).
+# Used by .github/workflows/ci.yml's backend-integration job to run the
+# full integration suite against every version in the supported range
+# (see README.md's "Supported PostgreSQL Versions") — set it yourself for
+# the same effect locally, e.g.:
+#   PGARCHIMIGRATOR_TEST_PG_VERSION=12 docker compose -f deploy/docker-compose.dev.yml up -d
+services:
+  pg-logical:
+    image: postgres:${PGARCHIMIGRATOR_TEST_PG_VERSION:-16}
+    environment:
+      POSTGRES_USER: pgarchimigrator
+      POSTGRES_PASSWORD: pgarchimigrator_dev_only
+      POSTGRES_DB: pgarchimigrator_test
+    # max_wal_size/checkpoint_completion_target are deliberately left at
+    # Postgres's own defaults below — normal integration tests never
+    # generate enough WAL to need larger ones, and leaving them off keeps
+    # this container's memory footprint small. If you're running
+    # cmd/loadtest (see the root README's "Load testing" section) against
+    # a large table, add these two flags to the `command:` list below
+    # first: a real run against the default configuration showed
+    # "checkpoints are occurring too frequently" warnings every 6-22
+    # seconds under cmd/loadtest's combined concurrent-traffic +
+    # full-speed backfill write load, and one checkpoint took 90 SECONDS
+    # to complete — directly causing multi-second query latency spikes
+    # unrelated to anything in the application code, that were initially
+    # (reasonably) mistaken for an application-level bug before
+    # pg_stat_activity and the PostgreSQL log ruled that out.
+    #   -c max_wal_size=4GB
+    #   -c checkpoint_completion_target=0.9
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=10
+      -c max_wal_senders=10
+    ports:
+      - "55432:5432"
+    volumes:
+      - pg_logical_data:/var/lib/postgresql/data
+      - ./pg-init:/docker-entrypoint-initdb.d
+
+  pg-legacy:
+    image: postgres:${PGARCHIMIGRATOR_TEST_PG_VERSION:-16}
+    environment:
+      POSTGRES_USER: pgarchimigrator
+      POSTGRES_PASSWORD: pgarchimigrator_dev_only
+      POSTGRES_DB: pgarchimigrator_test
+    command: >
+      postgres
+      -c wal_level=replica
+    ports:
+      - "55433:5432"
+    # Purpose: verify that the preflight check correctly detects the missing
+    # wal_level and returns a meaningful error (US-05).
+
+volumes:
+  pg_logical_data:

@@ -1,0 +1,10 @@
+{
+  "id": "20260826_add_status_column",
+  "description": "Add a status column to orders ahead of the fulfillment dashboard launch",
+  "schema": "public",
+  "table": "orders",
+  "operation": "ADD_COLUMN",
+  "column": "status",
+  "type": "text",
+  "default": "'active'"
+}

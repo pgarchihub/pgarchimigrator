@@ -1,0 +1,114 @@
+# StatefulSet, not Deployment, is used deliberately: pgArchiMigrator's
+# state store (internal/state, SQLite-backed) requires stable, persistent
+# per-pod storage that survives rescheduling — exactly what
+# volumeClaimTemplates below provides, and what a Deployment's
+# best-effort PVC handling does not guarantee as cleanly.
+#
+# replicas is HARDCODED to 1 and is NOT wired to any values.yaml field —
+# see values.yaml's comment on this. Running more than one replica against
+# independent state stores would let two instances each believe they own
+# migrations the other doesn't know about, and PostgreSQL-side resources
+# (replication slots, shadow tables) could be double-created or cleaned up
+# out from under an in-progress migration.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "pgarchimigrator.fullname" . }}
+  labels:
+    {{- include "pgarchimigrator.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "pgarchimigrator.fullname" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "pgarchimigrator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pgarchimigrator.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "pgarchimigrator.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: pgarchimigrator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - serve
+            - --addr=:{{ .Values.service.port }}
+            - --state-db=/data/pgarchimigrator-state.db
+            - --auto-sweep={{ .Values.autoSweep }}
+          env:
+            - name: PGARCHIMIGRATOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgarchimigrator.dbSecretName" . }}
+                  key: {{ include "pgarchimigrator.dbSecretKey" . }}
+            - name: PGARCHIMIGRATOR_ACTOR
+              value: {{ .Values.actor | quote }}
+            - name: PGARCHIMIGRATOR_AUDIT_LOG_PATH
+              value: /data/pgarchimigrator-audit.jsonl
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if not .Values.persistence.enabled }}
+      # WARNING: with persistence disabled, /data (and the state store
+      # within it) is lost on every pod restart — internal/reaper will
+      # never learn about in-flight migrations from before the restart,
+      # leaving their PostgreSQL-side resources (replication slots, shadow
+      # tables) permanently orphaned. Only disable persistence for
+      # throwaway/demo use.
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["{{ .Values.persistence.accessMode }}"]
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

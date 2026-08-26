@@ -1,0 +1,192 @@
+name: CI
+
+# Runs on every push to main and every pull request — the same checks
+# this project has been running manually throughout development (see
+# README.md's "Setup" section), now automated so a regression like the
+# ones found by hand in this codebase's history (a nil-vs-empty-slice bug,
+# an in-memory/DB sync gap, a timezone-dependent test) gets caught on the
+# very next push instead of waiting for someone to notice by hand.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancels a still-running workflow for the same branch/PR when a new
+# commit is pushed — otherwise every force-push or rapid-fire commit
+# queues up its own full run, burning CI minutes on results nobody will
+# read once a newer commit supersedes them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Baseline hardening: the default GITHUB_TOKEN is read-only unless a job
+# explicitly needs more (none here do).
+permissions:
+  contents: read
+
+jobs:
+  # --- Backend: unit tests (no database required) ------------------------
+  backend-unit:
+    name: Backend / unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          # actions/setup-go caches the module + build cache keyed on
+          # go.sum by default — no extra config needed.
+
+      - name: gofmt check
+        # gofmt -l lists files that are NOT correctly formatted; the repo
+        # should never have any, so a non-empty listing fails the build.
+        # This is the exact check used by hand throughout this project's
+        # development (see the many "gofmt -e" mentions in commit
+        # history) — codified here instead of relying on remembering to
+        # run it.
+        run: |
+          UNFORMATTED="$(gofmt -l .)"
+          if [ -n "$UNFORMATTED" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: govulncheck (dependency vulnerability scan)
+        # Cannot run in a sandboxed/offline dev environment (needs to
+        # reach the Go vulnerability database) — this is precisely why it
+        # belongs in CI rather than a local pre-commit step: every push
+        # gets a real, current scan against actual internet access,
+        # closing a gap a security self-audit could only flag, not verify.
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: go test (unit)
+        run: go test ./... -v
+
+  # --- Backend: integration tests (needs real PostgreSQL) -----------------
+  # Runs the full integration suite against every PostgreSQL major version
+  # this project claims to support (see README.md's "Supported PostgreSQL
+  # Versions") — fail-fast: false so one version's failure doesn't hide
+  # results from the others; each matrix entry is a genuinely independent
+  # job (parallelized by GitHub Actions, not run sequentially), so this
+  # doesn't multiply wall-clock time the way a naive loop would, though it
+  # does multiply total CI minutes consumed by roughly the matrix size —
+  # an accepted, deliberate cost for actually validating the claimed
+  # range rather than just asserting it in a README.
+  backend-integration:
+    name: Backend / integration tests (PG ${{ matrix.postgres-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres-version: [12, 13, 14, 15, 16, 17, 18]
+    env:
+      PGARCHIMIGRATOR_TEST_PG_VERSION: ${{ matrix.postgres-version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Start test PostgreSQL instances (PG ${{ matrix.postgres-version }})
+        # Reuses the exact same compose file used for local development
+        # (see README.md) — deliberately not a hand-duplicated set of
+        # GitHub Actions "services:" entries, which can't express the
+        # wal_level=logical / wal_level=replica command-line flags these
+        # tests specifically depend on without drifting out of sync with
+        # the file developers actually run locally.
+        # PGARCHIMIGRATOR_TEST_PG_VERSION (set above from the matrix) is
+        # what selects the image version — see docker-compose.dev.yml's
+        # own comment on this variable.
+        run: docker compose -f deploy/docker-compose.dev.yml up -d
+
+      - name: Wait for pg-logical to accept connections
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose -f deploy/docker-compose.dev.yml exec -T pg-logical pg_isready -U pgarchimigrator > /dev/null 2>&1; then
+              echo "pg-logical is ready"
+              exit 0
+            fi
+            echo "waiting for pg-logical... ($i/30)"
+            sleep 2
+          done
+          echo "pg-logical did not become ready in time" >&2
+          docker compose -f deploy/docker-compose.dev.yml logs pg-logical
+          exit 1
+
+      - name: go test (integration)
+        run: go test ./... -tags=integration -timeout 5m -v
+
+      - name: Tear down test PostgreSQL instances
+        if: always()
+        run: docker compose -f deploy/docker-compose.dev.yml down -v
+
+  # --- Frontend: tests + production build ---------------------------------
+  frontend:
+    name: Frontend / tests + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+
+      - name: npm audit (dependency vulnerability scan)
+        # continue-on-error: npm audit can flag transitive dev-dependency
+        # advisories with no real exploit path for this project (common,
+        # noisy false-positive source) — surfaced in the CI log either
+        # way, but shouldn't fail the whole pipeline over something that
+        # needs a human to actually triage, not an automatic block.
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: Vitest
+        # vite.config.ts pins TZ=Europe/Istanbul for this exact reason —
+        # a timezone-dependent bug in the date-range filter passed every
+        # test on a UTC runner and only failed on a real Istanbul
+        # machine. Pinning it means CI catches what a UTC-only runner
+        # would silently miss, regardless of which timezone this
+        # particular CI runner happens to be in.
+        run: npm test
+
+      - name: Production build (tsc -b + vite build)
+        run: npm run build
+
+  # --- Deployment artifacts: Docker image + Helm chart ---------------------
+  deployment-checks:
+    name: Deployment / Docker build + Helm lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker build
+        # Exercises the full multi-stage build, including the webbuild
+        # stage (Node + npm ci + npm run build) that produces the SPA
+        # embedded into the Go binary — catches a broken Dockerfile
+        # before it reaches anyone trying to deploy from main.
+        run: docker build -t pgarchimigrator:ci .
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: "latest"
+
+      - name: helm lint
+        run: helm lint deploy/helm/pgarchimigrator
+
+      - name: helm template (sanity-check manifest rendering)
+        run: helm template ci-check deploy/helm/pgarchimigrator > /dev/null
