@@ -40,8 +40,25 @@ services:
       -c max_wal_senders=10
     ports:
       - "55432:5432"
+    # Deliberately no persistent named volume — this is a throwaway test
+    # database (see this file's own top comment), and every integration
+    # test run benefits from starting against a genuinely clean cluster
+    # rather than whatever state survived from a previous `docker
+    # compose up`. This also sidesteps a real, version-specific breaking
+    # change: PostgreSQL 18's official Docker image switched to a
+    # major-version-specific data directory layout and now REFUSES to
+    # start at all if it finds the old-style mount point
+    # (/var/lib/postgresql/data) from a previous run — this exact
+    # combination broke CI's PG 18 matrix entry with "these Docker
+    # images are configured to store database data in a format which is
+    # compatible with pg_ctlcluster..." (see
+    # https://github.com/docker-library/postgres/pull/1259). Removing
+    # the volume entirely avoids needing a version-conditional mount
+    # path (/var/lib/postgresql/data pre-18 vs. /var/lib/postgresql on
+    # 18+) altogether — pg-legacy below already runs with no volume at
+    # all, this just brings pg-logical in line with that same, simpler,
+    # already-working pattern.
     volumes:
-      - pg_logical_data:/var/lib/postgresql/data
       - ./pg-init:/docker-entrypoint-initdb.d
 
   pg-legacy:
@@ -57,6 +74,3 @@ services:
       - "55433:5432"
     # Purpose: verify that the preflight check correctly detects the missing
     # wal_level and returns a meaningful error (US-05).
-
-volumes:
-  pg_logical_data:
