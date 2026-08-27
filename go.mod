@@ -1,13 +1,13 @@
 module github.com/pgarchihub/pgarchimigrator
 
-// pgx v5.9.1 (see the require block below) transitively requires Go
+// pgx v5.9.2 (see the require block below) transitively requires Go
 // >= 1.25.0. This directive is kept in sync with that — see the Dockerfile
 // build stage's comment for what breaks if it drifts out of sync again.
 go 1.25.0
 
 require (
 	github.com/jackc/pglogrepl v0.0.0-20260824121319-4ae5c490f7ce
-	github.com/jackc/pgx/v5 v5.9.1
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/spf13/cobra v1.8.0
 	golang.org/x/crypto v0.55.0
 	modernc.org/sqlite v1.29.5

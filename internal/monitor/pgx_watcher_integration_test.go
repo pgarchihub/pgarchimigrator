@@ -32,6 +32,21 @@ func connectPool(t *testing.T) *pgxpool.Pool {
 
 // TestCheckLockWait_NoLocks_ReturnsFalse verifies CheckLockWait returns
 // false under normal conditions (no pending locks).
+//
+// Requires exclusive use of the target database while it runs —
+// CheckLockWait's production behavior is deliberately database-wide (it
+// answers "is ANYTHING currently blocked, system-wide, that a live
+// migration should slow down or pause for" — see its own doc comment),
+// so this test's "no pending locks" assertion is only valid if nothing
+// ELSE is concurrently holding a lock on the same database. See the CI
+// workflow's own comment on `go test ... -p 1` (.github/workflows/ci.yml)
+// for a real, confirmed CI failure this caused: Go's default
+// cross-PACKAGE test parallelism let another package's own lock-
+// creating integration test (e.g. internal/ddlflow's lock_timeout
+// tests) run concurrently against this same shared PostgreSQL instance,
+// intermittently failing this exact assertion. If you're running this
+// test manually alongside other integration tests against the same
+// database, run it with `-p 1` too.
 func TestCheckLockWait_NoLocks_ReturnsFalse(t *testing.T) {
 	pool := connectPool(t)
 	w := monitor.NewPgxWatcher(pool, monitor.DefaultThresholds())

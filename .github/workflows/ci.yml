@@ -122,7 +122,24 @@ jobs:
           exit 1
 
       - name: go test (integration)
-        run: go test ./... -tags=integration -timeout 5m -v
+        # -p 1 forces packages to run ONE AT A TIME, not Go's default
+        # cross-package parallelism — every integration test package
+        # here shares ONE real PostgreSQL instance (the docker-compose
+        # services brought up above), and several packages deliberately
+        # create real locks/transactions as part of their own testing
+        # (see e.g. internal/ddlflow's lock_timeout tests,
+        # internal/shadowflow's swap tests). Without -p 1, Go runs those
+        # packages CONCURRENTLY with internal/monitor's
+        # TestCheckLockWait_NoLocks_ReturnsFalse — which asserts there
+        # are NO pending locks anywhere in the database — a real,
+        # confirmed flaky-CI-failure this exact combination caused: a
+        # completely unrelated package's test happened to be holding a
+        # lock at the same moment monitor's test ran its assertion. No
+        # test file here uses t.Parallel() (tests within a single
+        # package already ran sequentially before this fix), so -p 1
+        # only removes the CROSS-package race, not any real intra-
+        # package parallelism this project relies on.
+        run: go test ./... -tags=integration -timeout 5m -v -p 1
 
       - name: Tear down test PostgreSQL instances
         if: always()
