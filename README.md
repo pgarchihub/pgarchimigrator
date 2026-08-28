@@ -15,6 +15,24 @@ role-based auth, and a web dashboard. Originally scaffolded to mirror
 Design Doc) one-to-one; that mapping below is still accurate for the
 backend's package layout.
 
+## Screenshots
+
+Migration list — every migration tracked from start to rollback
+window, with fleet-wide analytics (failure rate, average duration, a
+per-strategy breakdown) computed from the same history.
+![Migration list](docs/images/pgArchiMigrator_01_Migration_List.png)
+
+Migration detail — a health summary, live progress, resource-cleanup
+verification, and the exact duration and row count for every completed
+migration.
+![Migration detail](docs/images/pgArchiMigrator_02_Migration_Detail.png)
+
+New migration — automatic strategy selection (here, a 10M-row
+`ALTER COLUMN TYPE` correctly routed to `SHADOW_TABLE`), with a live
+dry-run preview, warnings, and the table's real schema and sample data
+before anything runs.
+![New migration](docs/images/pgArchiMigrator_03_New_Migration.png)
+
 ## Supported PostgreSQL Versions
 
 **PostgreSQL 12 through 18** — every version in this range is validated
