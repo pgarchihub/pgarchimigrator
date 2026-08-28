@@ -17,20 +17,23 @@ backend's package layout.
 
 ## Screenshots
 
-Migration list — every migration tracked from start to rollback
+**Migration list** — every migration tracked from start to rollback
 window, with fleet-wide analytics (failure rate, average duration, a
 per-strategy breakdown) computed from the same history.
+
 ![Migration list](docs/images/pgArchiMigrator_01_Migration_List.png)
 
-Migration detail — a health summary, live progress, resource-cleanup
+**Migration detail** — a health summary, live progress, resource-cleanup
 verification, and the exact duration and row count for every completed
 migration.
+
 ![Migration detail](docs/images/pgArchiMigrator_02_Migration_Detail.png)
 
-New migration — automatic strategy selection (here, a 10M-row
+**New migration** — automatic strategy selection (here, a 10M-row
 `ALTER COLUMN TYPE` correctly routed to `SHADOW_TABLE`), with a live
 dry-run preview, warnings, and the table's real schema and sample data
 before anything runs.
+
 ![New migration](docs/images/pgArchiMigrator_03_New_Migration.png)
 
 ## Supported PostgreSQL Versions
@@ -214,6 +217,13 @@ go run ./cmd/loadtest run \
 The target table needs a PRIMARY KEY for `SHADOW_TABLE` specifically
 (unlike `DIRECT_DDL`/`EXPAND_BACKFILL`) — `loadtest generate`'s table
 already has one (`id BIGSERIAL PRIMARY KEY`).
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to run this locally and
+what to know before opening a pull request. Found a security issue?
+Please see [`SECURITY.md`](SECURITY.md) instead of opening a public
+issue.
 
 ## License
 
