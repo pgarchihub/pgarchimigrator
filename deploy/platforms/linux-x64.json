@@ -1,0 +1,9 @@
+{
+  "os": "linux",
+  "arch": "x64",
+  "goos": "linux",
+  "goarch": "amd64",
+  "archive": "tar.gz",
+  "binaryName": "pgarchimigrator",
+  "nativeSigningExpectation": "Repository/package signing when native packages are introduced — deferred, see AOL-STD-DEPLOY-001 §5.3"
+}

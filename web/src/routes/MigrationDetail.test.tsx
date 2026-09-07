@@ -8,6 +8,7 @@ vi.mock("../lib/api", () => ({
     me: vi.fn(),
     getMigration: vi.fn(),
     rollbackMigration: vi.fn(),
+    retryMigration: vi.fn(),
     setupRequired: vi.fn().mockResolvedValue({ required: false }),
     getVersion: vi.fn().mockResolvedValue({ version: "test" }),
   },
@@ -57,7 +58,6 @@ function renderDetail() {
     <AuthProvider>
       <MemoryRouter
         initialEntries={["/migrations/job-1"]}
-        future={{ v7_startTransition: true, v7_relativeSplatPath: true }}
       >
         <Routes>
           <Route path="/migrations/:id" element={<MigrationDetail />} />
@@ -714,6 +714,40 @@ describe("MigrationDetail — does not crash on a null Statements field", () => 
     ).not.toBeInTheDocument();
   });
 
+  // Direct regression test for validatedSuccessDetail's PARTITION_TABLE
+  // case being checked BEFORE the generic SHADOW_TABLE fallback — since
+  // PARTITION_TABLE always uses SHADOW_TABLE strategy (see
+  // strategy.OpPartitionTable's own doc comment), it would otherwise
+  // silently fall into the generic message, which isn't WRONG but is
+  // less specific than what actually happened (every partition, not
+  // just "the shadow table" as a single undifferentiated whole).
+  it("shows a PARTITION_TABLE-specific validation message, not the generic SHADOW_TABLE one", async () => {
+    vi.mocked(api.getMigration).mockResolvedValue(
+      makeJob({
+        Strategy: "SHADOW_TABLE",
+        Operation: "PARTITION_TABLE",
+        Terminal: true,
+        Failed: false,
+        Stages: [
+          { Phase: "PREFLIGHT", Status: "DONE" },
+          { Phase: "PREPARATION", Status: "DONE" },
+          { Phase: "SYNCING", Status: "DONE" },
+          { Phase: "DELTA_SYNC", Status: "DONE" },
+          { Phase: "VALIDATING", Status: "DONE" },
+          { Phase: "SWAPPING", Status: "DONE" },
+          { Phase: "ROLLBACK_WINDOW", Status: "DONE" },
+          { Phase: "CLEANUP", Status: "DONE" },
+          { Phase: "COMPLETED", Status: "DONE" },
+        ],
+      }),
+    );
+    renderDetail();
+
+    expect(await screen.findByText("Health summary")).toBeInTheDocument();
+    expect(screen.getByText("Data validated")).toBeInTheDocument();
+    expect(screen.getByText(/across every partition/)).toBeInTheDocument();
+  });
+
   // Direct regression test for the exact real incident this whole
   // feature line exists to make visible at a glance: a migration that
   // failed AND left a resource behind — both must show as distinct
@@ -756,5 +790,51 @@ describe("MigrationDetail — does not crash on a null Statements field", () => 
 
     expect(await screen.findByRole("heading", { name: "public.orders" })).toBeInTheDocument();
     expect(screen.queryByText("SQL")).not.toBeInTheDocument();
+  });
+});
+
+describe("MigrationDetail — retry", () => {
+  it("shows a Retry button only for a failed migration", async () => {
+    vi.mocked(api.getMigration).mockResolvedValue(makeJob({ Failed: true, CurrentPhase: "PREPARATION" }));
+    renderDetail();
+
+    expect(await screen.findByRole("button", { name: /retry this migration/i })).toBeInTheDocument();
+  });
+
+  it("hides the Retry button for a migration that did not fail", async () => {
+    vi.mocked(api.getMigration).mockResolvedValue(makeJob({ Failed: false, Terminal: true, CurrentPhase: "COMPLETED" }));
+    renderDetail();
+
+    await screen.findByRole("heading", { name: "public.orders" });
+    expect(screen.queryByRole("button", { name: /retry this migration/i })).not.toBeInTheDocument();
+  });
+
+  // Direct regression test for handleRetry navigating to the NEW job's
+  // own detail page — the whole point of retry is that the user ends
+  // up looking at a fresh, running job, not the old failed one.
+  it("navigates to the new job's detail page after a successful retry", async () => {
+    vi.mocked(api.getMigration).mockImplementation(async (id: string) =>
+      id === "job-2" ? makeJob({ JobID: "job-2", Failed: false, CurrentPhase: "PREPARATION" }) : makeJob({ Failed: true }),
+    );
+    vi.mocked(api.retryMigration).mockResolvedValue(makeJob({ JobID: "job-2", Failed: false }));
+    const user = userEvent.setup();
+    renderDetail();
+
+    await user.click(await screen.findByRole("button", { name: /retry this migration/i }));
+
+    expect(api.retryMigration).toHaveBeenCalledWith("job-1");
+    await waitFor(() => expect(api.getMigration).toHaveBeenCalledWith("job-2", expect.anything()));
+  });
+
+  it("shows an error message when the retry request fails", async () => {
+    vi.mocked(api.getMigration).mockResolvedValue(makeJob({ Failed: true }));
+    const { ApiError } = await import("../lib/api");
+    vi.mocked(api.retryMigration).mockRejectedValue(new ApiError(500, "retry failed unexpectedly"));
+    const user = userEvent.setup();
+    renderDetail();
+
+    await user.click(await screen.findByRole("button", { name: /retry this migration/i }));
+
+    expect(await screen.findByText("retry failed unexpectedly")).toBeInTheDocument();
   });
 });

@@ -1,0 +1,9 @@
+{
+  "os": "macos",
+  "arch": "arm64",
+  "goos": "darwin",
+  "goarch": "arm64",
+  "archive": "tar.gz",
+  "binaryName": "pgarchimigrator",
+  "nativeSigningExpectation": "Developer ID signing and notarization for public native release — deferred, see AOL-STD-DEPLOY-001 §5.3"
+}

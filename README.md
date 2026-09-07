@@ -1,19 +1,25 @@
 # pgArchiMigrator
 
 [![CI](https://github.com/pgarchihub/pgarchimigrator/actions/workflows/ci.yml/badge.svg)](https://github.com/pgarchihub/pgarchimigrator/actions/workflows/ci.yml)
-![Version](https://img.shields.io/badge/version-v1.0.0-blue)
+![Version](https://img.shields.io/badge/version-v2.0.0-blue)
+![Edition](https://img.shields.io/badge/edition-Community-2f7d73)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-12--18-blue)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/pgarchihub/pgarchimigrator/blob/main/LICENSE)
 
-A CLI/service tool for zero-downtime schema changes on PostgreSQL — 8
+This is the **Community Edition** — part of the
+[pgArchiHub](https://pgarchihub.com) product family, developed by
+ArchiOrbit Labs.
+
+A CLI/service tool for zero-downtime schema changes on PostgreSQL — 12
 operation types (`ADD_COLUMN`, `DROP_COLUMN`, `ALTER_COLUMN_TYPE`,
 `ADD_INDEX`, `DROP_INDEX`, `SET_NOT_NULL`, `ADD_CONSTRAINT`,
-`RENAME_COLUMN`), each routed automatically to the cheapest safe strategy
-(Direct DDL / Expand & Backfill / Shadow Table), with dry-run previews,
-role-based auth, and a web dashboard. Originally scaffolded to mirror
-`pgArchiMigrator_Migrator_-_Mimari_Tasarım_Dokümanı__v2.md` (the Architecture
-Design Doc) one-to-one; that mapping below is still accurate for the
-backend's package layout.
+`RENAME_COLUMN`, `RENAME_TABLE`, `ADD_FOREIGN_KEY`,
+`ADD_GENERATED_COLUMN`, `PARTITION_TABLE`), each routed automatically to
+the cheapest safe strategy (Direct DDL / Expand & Backfill / Shadow
+Table), with dry-run previews, role-based auth, and a web dashboard.
+Originally scaffolded to mirror this project's own internal
+Architecture Design Document one-to-one; that mapping below is still
+accurate for the backend's package layout.
 
 ## Screenshots
 
@@ -68,8 +74,8 @@ not just documented as "should work."
 | `internal/strategy` | 4.0 (Strategy Decision Matrix) | Operation type + table size → strategy decision |
 | `internal/typecompat` | 4.0 (extension) | Automatic type-cast compatibility detection for `ALTER_COLUMN_TYPE` |
 | `internal/orchestrator` | 3.1 | Orchestration Engine: State Manager + Step Executor |
-| `internal/ddlflow` | 4.0 rows 1-4 | Direct DDL / Expand & Backfill flow (6 of the 8 operation types) |
-| `internal/shadowflow` | 4.1, 4.3 | Shadow Table + Logical Replication flow (Decoder, SyncEngine, Apply, Swap) |
+| `internal/ddlflow` | 4.0 rows 1-4 | Direct DDL / Expand & Backfill flow (10 of the 12 operation types; `ALTER_COLUMN_TYPE` and `PARTITION_TABLE` route here only when the table/change is small enough not to need Shadow Table) |
+| `internal/shadowflow` | 4.1, 4.3 | Shadow Table + Logical Replication flow — `ALTER_COLUMN_TYPE` (incompatible casts) and `PARTITION_TABLE` (always, at any table size — see `strategy.OpPartitionTable`'s own doc comment for why) |
 | `internal/preview` | (extension) | Dry-run: strategy + SQL + read-only pre-flight warnings, no DB writes |
 | `internal/monitor` | 3.3 | Performance Monitor, Lock Detector (throttle signals) |
 | `internal/reaper` | 3.3 (Orphan Resource Reaper) | Cleanup of orphaned slots/shadow tables/triggers |
@@ -78,6 +84,35 @@ not just documented as "should work."
 | `internal/auditlog` | 3.3, 6 | JSON audit log writer |
 | `internal/api` | 5 | REST API + embedded web dashboard |
 | `web/` | 5 ("Basit Web UI") | React SPA dashboard — built separately, embedded into the Go binary (see below) |
+
+## Quick Start (Install Script)
+
+Prefer a native binary over Docker? One line downloads the right
+portable package for your OS/architecture, verifies its checksum, and
+installs it to this project's own standard location
+(`internal/deploylayout`):
+
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/pgarchihub/pgarchimigrator/main/scripts/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/pgarchihub/pgarchimigrator/main/scripts/install.ps1 | iex
+```
+
+This verifies the download's SHA-256 checksum, but NOT the Ed25519
+artifact-descriptor signature (see `cmd/pgarchisign`) — that's a
+stronger, separate guarantee the script prints instructions for at the
+end, worth doing if you want assurance the artifact was genuinely built
+by this project rather than just "whatever bytes were at this URL."
+See `scripts/install.sh`'s own header comment for why that step isn't
+automated inside the installer itself.
+
+Supported platforms today: Linux (x64/arm64), macOS (Apple Silicon
+only — Intel isn't published yet), Windows (x64). See
+`deploy/platforms/` for the exact matrix.
 
 ## Quick Start (Docker)
 

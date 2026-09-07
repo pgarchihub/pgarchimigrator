@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest an operation, integration, or improvement.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What are you trying to do that pgArchiMigrator doesn't support today?
+      placeholder: "I need to partition an existing table without downtime, and..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to see?
+      description: Your best guess at how this could work — an API shape, a CLI flag, a new operation type, whatever makes sense.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What are you doing today instead?
+      description: A manual workaround, a different tool, or just not doing it — helps gauge how painful the gap actually is.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of the project is this closest to?
+      options:
+        - "Not sure"
+        - New operation type (e.g. PARTITION_TABLE, ADD_FOREIGN_KEY)
+        - Migration as Code (JSON files, CI preview)
+        - Web dashboard / UI
+        - CLI
+        - Trust-layer indicators (lag, checkpoint, impact measurement)
+        - Something else entirely
+    validations:
+      required: false

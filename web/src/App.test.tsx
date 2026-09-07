@@ -31,7 +31,7 @@ import App from "./App";
 
 function renderApp(initialPath: string) {
   return render(
-    <MemoryRouter initialEntries={[initialPath]} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+    <MemoryRouter initialEntries={[initialPath]}>
       <App />
     </MemoryRouter>,
   );
@@ -84,6 +84,6 @@ describe("App routing — setup wizard vs. login vs. the app", () => {
     vi.mocked(api.setupRequired).mockResolvedValue({ required: false });
     renderApp("/");
 
-    expect(await screen.findByRole("heading", { name: "Migrations" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Zero-Downtime Migration" })).toBeInTheDocument();
   });
 });

@@ -87,3 +87,52 @@ func ValidateSQLExpression(expr, fieldName string) error {
 	}
 	return nil
 }
+
+// validOnDeleteActions is PostgreSQL's own closed set of valid ON DELETE
+// referential actions for a foreign key constraint — see
+// ValidateOnDeleteAction's own doc comment for why this is a strict
+// allow-list rather than the general ValidateSQLExpression blocklist
+// above.
+var validOnDeleteActions = map[string]bool{
+	"CASCADE":     true,
+	"SET NULL":    true,
+	"SET DEFAULT": true,
+	"RESTRICT":    true,
+	"NO ACTION":   true,
+}
+
+// ValidateOnDeleteAction checks action (ColumnChange.OnDelete) against
+// PostgreSQL's own closed set of valid ON DELETE referential actions.
+// Unlike DefaultValue/CheckExpression above — which are inherently
+// arbitrary SQL expressions, only checkable against a blocklist of
+// known-dangerous patterns — this field only ever needs to be one of a
+// handful of fixed keyword phrases, so a strict, exact allow-list is
+// both possible and strictly safer than a blocklist: anything not
+// exactly one of these five phrases is rejected outright, not just
+// anything that happens to look dangerous. Empty is valid too — it
+// means PostgreSQL's own default (NO ACTION), not "no ON DELETE clause
+// at all" (see internal/ddlflow.executeAddForeignKey for how an empty
+// value is handled).
+func ValidateOnDeleteAction(action string) error {
+	if action == "" {
+		return nil
+	}
+	if !validOnDeleteActions[action] {
+		return fmt.Errorf("on_delete %q is not a valid PostgreSQL referential action — must be one of CASCADE, SET NULL, SET DEFAULT, RESTRICT, NO ACTION, or empty for the default (NO ACTION)", action)
+	}
+	return nil
+}
+
+// ValidatePartitionStrategy checks strategyName (ColumnChange.PartitionStrategy)
+// against the two partitioning strategies this project supports — same
+// exact-allow-list reasoning as ValidateOnDeleteAction: a closed set of
+// literal keyword phrases, not an arbitrary expression, so a strict
+// allow-list is both possible and strictly safer than a blocklist. HASH
+// partitioning is deliberately not included — see strategy.OpPartitionTable's
+// own doc comment for why this project only supports RANGE and LIST.
+func ValidatePartitionStrategy(strategyName string) error {
+	if strategyName != "RANGE" && strategyName != "LIST" {
+		return fmt.Errorf("partition_strategy %q is not supported — must be RANGE or LIST", strategyName)
+	}
+	return nil
+}

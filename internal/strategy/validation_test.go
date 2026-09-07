@@ -107,3 +107,43 @@ func TestValidateSQLExpression_IncludesFieldNameInErrorMessage(t *testing.T) {
 		t.Fatal("expected a non-empty error message")
 	}
 }
+
+func TestValidateOnDeleteAction_AcceptsEmpty(t *testing.T) {
+	// Empty means PostgreSQL's own default (NO ACTION), not "no ON
+	// DELETE clause at all" — see ValidateOnDeleteAction's own doc
+	// comment.
+	if err := ValidateOnDeleteAction(""); err != nil {
+		t.Errorf("expected empty to be accepted, got error: %v", err)
+	}
+}
+
+func TestValidateOnDeleteAction_AcceptsEveryValidPostgresAction(t *testing.T) {
+	valid := []string{"CASCADE", "SET NULL", "SET DEFAULT", "RESTRICT", "NO ACTION"}
+	for _, v := range valid {
+		if err := ValidateOnDeleteAction(v); err != nil {
+			t.Errorf("expected %q to be accepted, got error: %v", v, err)
+		}
+	}
+}
+
+// TestValidateOnDeleteAction_RejectsAnythingOutsideTheClosedSet is the
+// direct regression test for the actual security property this
+// validator provides: unlike ValidateSQLExpression's blocklist (which
+// only catches known-dangerous PATTERNS), this is a strict allow-list —
+// literally anything that isn't exactly one of the five valid phrases
+// is rejected, including values a pattern-based blocklist alone
+// wouldn't necessarily catch.
+func TestValidateOnDeleteAction_RejectsAnythingOutsideTheClosedSet(t *testing.T) {
+	invalid := []string{
+		"cascade",                   // lowercase — not an exact match
+		"CASCADE ",                  // trailing space
+		"DELETE",                    // a real SQL keyword, but not a valid ON DELETE action
+		"CASCADE; DROP TABLE users", // an actual injection attempt
+		"UNKNOWN_ACTION",
+	}
+	for _, v := range invalid {
+		if err := ValidateOnDeleteAction(v); err == nil {
+			t.Errorf("expected %q to be rejected, but it was accepted", v)
+		}
+	}
+}

@@ -3,7 +3,7 @@
 
 image:
   repository: ghcr.io/pgarchihub/pgarchimigrator
-  tag: "1.0.0"
+  tag: "2.0.0"
   pullPolicy: IfNotPresent
 
 # IMPORTANT (TR-13): replicas is intentionally NOT exposed as a

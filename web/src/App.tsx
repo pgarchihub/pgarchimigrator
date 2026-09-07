@@ -7,6 +7,9 @@ import Setup from "./routes/Setup";
 import Dashboard from "./routes/Dashboard";
 import NewMigration from "./routes/NewMigration";
 import MigrationDetail from "./routes/MigrationDetail";
+import UpgradesList from "./routes/UpgradesList";
+import NewUpgrade from "./routes/NewUpgrade";
+import UpgradeDetail from "./routes/UpgradeDetail";
 import Users from "./routes/Users";
 import Help from "./routes/Help";
 
@@ -72,6 +75,9 @@ function AppRoutes() {
                 <Route path="/" element={<Dashboard />} />
                 <Route path="/new" element={<NewMigration />} />
                 <Route path="/migrations/:id" element={<MigrationDetail />} />
+                <Route path="/upgrades" element={<UpgradesList />} />
+                <Route path="/upgrades/new" element={<NewUpgrade />} />
+                <Route path="/upgrades/:id" element={<UpgradeDetail />} />
                 <Route path="/users" element={<Users />} />
                 <Route path="/help" element={<Help />} />
                 <Route path="*" element={<Navigate to="/" replace />} />

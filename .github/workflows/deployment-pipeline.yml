@@ -1,0 +1,117 @@
+name: Deployment Pipeline
+
+# Verifies AOL-STD-DEPLOY-001 §13's own reference pipeline stages
+# (Build -> Checksums -> Sign -> Verify) actually work end to end —
+# this is item 7 of the 8-item Community Edition scope (see
+# docs/ecosystem/DEPLOYMENT.md). Does NOT publish anything anywhere:
+# the deploy/release-channels.json channel is "internal" (unpublished)
+# per product decision, so this workflow's entire job is proving the
+# pipeline itself is correct, not shipping a release. Artifacts are
+# kept as GitHub Actions' own run artifacts (7-day retention) for
+# inspection, never pushed to a registry or a public download location.
+#
+# Runs on every push/PR that touches the packaging surface (scripts/,
+# deploy/, cmd/pgarchisign, the runtime-verification/attestation
+# packages), plus a manual trigger — unlike migration-apply.yml, this
+# workflow never touches a real database or a real signing key, so it's
+# safe to run automatically rather than gating it behind a human click.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "deploy/**"
+      - "cmd/pgarchisign/**"
+      - "internal/agentattestation/**"
+      - "internal/runtimeverify/**"
+      - "internal/deploylayout/**"
+      - ".github/workflows/deployment-pipeline.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - "deploy/**"
+      - "cmd/pgarchisign/**"
+      - "internal/agentattestation/**"
+      - "internal/runtimeverify/**"
+      - "internal/deploylayout/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-sign-verify:
+    name: Build, checksum, sign, and verify (source + one portable package)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # build-artifact.sh's `git archive` needs real history, not a shallow clone
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: go build ./... (every package, including cmd/pgarchisign)
+        run: go build ./...
+
+      - name: go test ./... (every package's own unit tests)
+        run: go test ./...
+
+      - name: Build pgarchisign
+        run: go build -o pgarchisign ./cmd/pgarchisign
+
+      - name: Build the source package
+        run: ./scripts/build-artifact.sh source
+
+      - name: Build a portable package (linux-x64, this runner's own platform)
+        run: ./scripts/build-artifact.sh portable deploy/platforms/linux-x64.json
+
+      - name: Generate checksums
+        run: ./scripts/generate-checksums.sh dist
+
+      - name: Generate a CI-only test signing key
+        # NOT the real ArchiOrbit Labs release key — see cmd/pgarchisign's
+        # own doc comment. This proves the sign/verify MECHANISM works;
+        # the real key's generation and custody is a separate,
+        # organizational decision (docs/ecosystem/DEPLOYMENT.md).
+        run: ./pgarchisign genkey --out-dir ./ci-test-keys
+
+      - name: Sign every built artifact
+        run: |
+          for artifact in dist/*.tar.gz dist/*.zip; do
+            [ -e "$artifact" ] || continue
+            ./pgarchisign sign \
+              --artifact "$artifact" \
+              --key ./ci-test-keys/ed25519-private.key \
+              --key-id ci-test-key \
+              --product-id pgarchimigrator \
+              --version 2.0.0
+          done
+
+      - name: Verify every signed artifact
+        # The direct proof this whole job exists to provide: a package
+        # built by this pipeline is genuinely verifiable end to end —
+        # not just "a descriptor file got created somewhere."
+        run: |
+          for artifact in dist/*.tar.gz dist/*.zip; do
+            [ -e "$artifact" ] || continue
+            ./pgarchisign verify \
+              --descriptor "${artifact}.descriptor.json" \
+              --pubkey ./ci-test-keys/ed25519-public.key \
+              --artifact "$artifact"
+          done
+
+      - name: Upload artifacts for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgarchimigrator-deployment-pipeline-${{ github.run_id }}
+          path: |
+            dist/
+          retention-days: 7
+          if-no-files-found: error

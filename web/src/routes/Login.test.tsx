@@ -37,7 +37,7 @@ import Login from "./Login";
 async function renderLogin() {
   const result = render(
     <AuthProvider>
-      <MemoryRouter initialEntries={["/login"]} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <MemoryRouter initialEntries={["/login"]}>
         <Login />
       </MemoryRouter>
     </AuthProvider>,

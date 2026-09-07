@@ -47,14 +47,34 @@ type MigrationFile struct {
 	Table     string `json:"table"`
 	Operation string `json:"operation"`
 
-	Column           string `json:"column,omitempty"`
-	Type             string `json:"type,omitempty"`
-	Default          string `json:"default,omitempty"`
-	VolatileDefault  bool   `json:"volatile_default,omitempty"`
-	IndexName        string `json:"index_name,omitempty"`
-	ConstraintName   string `json:"constraint_name,omitempty"`
-	CheckExpression  string `json:"check_expression,omitempty"`
-	NewColumnName    string `json:"new_column_name,omitempty"`
+	Column              string `json:"column,omitempty"`
+	Type                string `json:"type,omitempty"`
+	Default             string `json:"default,omitempty"`
+	VolatileDefault     bool   `json:"volatile_default,omitempty"`
+	IndexName           string `json:"index_name,omitempty"`
+	ConstraintName      string `json:"constraint_name,omitempty"`
+	CheckExpression     string `json:"check_expression,omitempty"`
+	NewColumnName       string `json:"new_column_name,omitempty"`
+	NewTableName        string `json:"new_table_name,omitempty"`
+	ReferencedTable     string `json:"referenced_table,omitempty"`
+	ReferencedColumn    string `json:"referenced_column,omitempty"`
+	OnDelete            string `json:"on_delete,omitempty"`
+	GeneratedExpression string `json:"generated_expression,omitempty"`
+
+	// The fields below are used ONLY by PARTITION_TABLE — see
+	// internal/api's startMigrationRequest identical fields for the
+	// full reasoning (bounds can be specified explicitly via
+	// PartitionBounds, or, for RANGE only, via the
+	// PartitionInterval/PartitionRuleFrom/PartitionRuleTo rule-based
+	// shortcut — see strategy.ExpandPartitionRule).
+	PartitionColumn         string                    `json:"partition_column,omitempty"`
+	PartitionStrategy       string                    `json:"partition_strategy,omitempty"`
+	PartitionIncludeDefault bool                      `json:"partition_include_default,omitempty"`
+	PartitionBounds         []strategy.PartitionBound `json:"partition_bounds,omitempty"`
+	PartitionInterval       string                    `json:"partition_interval,omitempty"`
+	PartitionRuleFrom       string                    `json:"partition_rule_from,omitempty"`
+	PartitionRuleTo         string                    `json:"partition_rule_to,omitempty"`
+
 	StrategyOverride string `json:"strategy_override,omitempty"`
 }
 
@@ -89,24 +109,63 @@ func (m MigrationFile) Validate() error {
 // being a file field — WHO applied a migration is a property of the
 // applying context (a CI run, a specific operator), not something that
 // belongs hardcoded into a version-controlled file everyone shares.
-func (m MigrationFile) ToMigrationRequest(actor string) orchestrator.MigrationRequest {
+func (m MigrationFile) ToMigrationRequest(actor string) (orchestrator.MigrationRequest, error) {
 	schema := m.Schema
 	if schema == "" {
 		schema = "public"
 	}
+
+	// PARTITION_TABLE's bounds may be specified explicitly, or via
+	// ExpandPartitionRule's rule-based shortcut (RANGE only) — see
+	// MigrationFile.PartitionInterval's own doc comment. Expanded here,
+	// before construction, so internal/orchestrator/internal/ddlflow/
+	// internal/shadowflow only ever see the final, explicit bounds —
+	// same reasoning as internal/api's identical handling.
+	var partitionBoundsJSON string
+	if strategy.Operation(m.Operation) == strategy.OpPartitionTable {
+		bounds := m.PartitionBounds
+		if len(bounds) == 0 {
+			if m.PartitionStrategy != "RANGE" {
+				return orchestrator.MigrationRequest{}, fmt.Errorf("partition_bounds is required for LIST partitioning (no rule-based shortcut exists for it)")
+			}
+			if m.PartitionInterval == "" || m.PartitionRuleFrom == "" || m.PartitionRuleTo == "" {
+				return orchestrator.MigrationRequest{}, fmt.Errorf("either partition_bounds, or all of partition_interval/partition_rule_from/partition_rule_to, is required for PARTITION_TABLE")
+			}
+			expanded, err := strategy.ExpandPartitionRule(m.PartitionInterval, m.PartitionRuleFrom, m.PartitionRuleTo, m.Table)
+			if err != nil {
+				return orchestrator.MigrationRequest{}, err
+			}
+			bounds = expanded
+		}
+		boundsJSON, err := json.Marshal(bounds)
+		if err != nil {
+			return orchestrator.MigrationRequest{}, fmt.Errorf("failed to encode partition bounds: %w", err)
+		}
+		partitionBoundsJSON = string(boundsJSON)
+	}
+
 	return orchestrator.MigrationRequest{
 		SchemaName: schema,
 		TableName:  m.Table,
 		Change: strategy.ColumnChange{
-			Operation:         strategy.Operation(m.Operation),
-			ColumnName:        m.Column,
-			NewType:           m.Type,
-			DefaultValue:      m.Default,
-			IsVolatileDefault: m.VolatileDefault,
-			IndexName:         m.IndexName,
-			ConstraintName:    m.ConstraintName,
-			CheckExpression:   m.CheckExpression,
-			NewColumnName:     m.NewColumnName,
+			Operation:               strategy.Operation(m.Operation),
+			ColumnName:              m.Column,
+			NewType:                 m.Type,
+			DefaultValue:            m.Default,
+			IsVolatileDefault:       m.VolatileDefault,
+			IndexName:               m.IndexName,
+			ConstraintName:          m.ConstraintName,
+			CheckExpression:         m.CheckExpression,
+			NewColumnName:           m.NewColumnName,
+			NewTableName:            m.NewTableName,
+			ReferencedTable:         m.ReferencedTable,
+			ReferencedColumn:        m.ReferencedColumn,
+			OnDelete:                m.OnDelete,
+			GeneratedExpression:     m.GeneratedExpression,
+			PartitionColumn:         m.PartitionColumn,
+			PartitionStrategy:       m.PartitionStrategy,
+			PartitionBoundsJSON:     partitionBoundsJSON,
+			PartitionIncludeDefault: m.PartitionIncludeDefault,
 		},
 		StrategyOverride: strategy.Strategy(m.StrategyOverride),
 		Actor:            actor,
@@ -115,7 +174,7 @@ func (m MigrationFile) ToMigrationRequest(actor string) orchestrator.MigrationRe
 		// against to decide whether this migration has already run.
 		Name:        m.ID,
 		Description: m.Description,
-	}
+	}, nil
 }
 
 // LoadFile reads and parses a single migration file.

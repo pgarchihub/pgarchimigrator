@@ -1,0 +1,78 @@
+name: Publish Image
+
+# Builds the Docker image (see the repo root Dockerfile) and pushes it
+# to GitHub Container Registry — this is what actually produces the
+# `ghcr.io/pgarchihub/pgarchimigrator:latest` image the README's own
+# "Quick Start (Docker)" section tells people to `docker run`. Without
+# this workflow, that instruction has nothing behind it — CI's own
+# ci.yml only ever runs `docker build` locally to confirm the Dockerfile
+# still builds; it never pushes anywhere.
+#
+# Triggered by pushing a version tag (e.g. `git tag v2.0.0 && git push
+# origin v2.0.0`) — the same tag you'd create for a GitHub Release, so
+# "cut a release" and "publish its image" are the same action, not two
+# separately-remembered steps. Also runnable manually (workflow_dispatch)
+# for rebuilding an existing tag's image without cutting a new one, e.g.
+# after rotating a base image for a security patch.
+#
+# Publishes two tags on every run: the exact version (e.g. `v2.0.0`) and
+# `latest`, both pointing at the same multi-platform (amd64 + arm64)
+# manifest — `latest` always means "the most recently tagged release",
+# never a build off an arbitrary main commit.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing git tag to rebuild and publish (e.g. v2.0.0)"
+        required: true
+
+permissions:
+  contents: read
+  packages: write # needed to push to ghcr.io
+
+jobs:
+  publish:
+    name: Build and publish image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve the version tag
+        id: version
+        run: |
+          RAW_REF="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$RAW_REF" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3 # needed for the arm64 leg of the multi-platform build below
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN, not a separately-configured secret — GHCR
+          # accepts the workflow's own built-in token for pushing to a
+          # package owned by the same repository/org, so there's
+          # nothing extra to set up here.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/pgarchihub/pgarchimigrator:${{ steps.version.outputs.tag }}
+            ghcr.io/pgarchihub/pgarchimigrator:latest
+          # Layer caching across runs — meaningfully speeds up rebuilds
+          # that only touch the Go build stage, not the frontend one.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

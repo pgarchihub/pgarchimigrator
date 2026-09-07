@@ -240,6 +240,153 @@ func TestCompute_DropIndex_DirectDDL_StillUsesTwoStagePipeline(t *testing.T) {
 	}
 }
 
+// TestCompute_RenameTable_DirectDDL_UsesTwoStagePipeline confirms
+// RENAME_TABLE (RENAME TO + a single CREATE VIEW, see
+// strategy.OpRenameTable's own doc comment) also uses the plain 2-stage
+// pipeline — like DROP_INDEX above, there's no separate "is this
+// correct" check beyond the two statements themselves succeeding, so no
+// distinct VALIDATING stage is warranted the way ADD_INDEX's genuinely
+// has one.
+func TestCompute_RenameTable_DirectDDL_UsesTwoStagePipeline(t *testing.T) {
+	job := &state.Job{ID: "j11d", Strategy: "DIRECT_DDL", Operation: "RENAME_TABLE", Phase: state.PhaseCompleted}
+	report := Compute(job)
+
+	if len(report.Stages) != 2 {
+		t.Fatalf("expected the plain 2-stage RENAME_TABLE pipeline, got %d stages: %+v", len(report.Stages), report.Stages)
+	}
+}
+
+// TestRender_RenameTable_MentionsCompatibilityView is the direct
+// regression test for Render()'s RENAME_TABLE summary actually
+// describing the real, distinguishing behavior (a compatibility view
+// under the old name) — not just a generic "renamed" message that would
+// be misleading about what actually happens to callers still using the
+// old name.
+func TestRender_RenameTable_MentionsCompatibilityView(t *testing.T) {
+	job := &state.Job{
+		ID: "j11e", Strategy: "DIRECT_DDL", Operation: "RENAME_TABLE", Phase: state.PhaseCompleted,
+		SchemaName: "public", TableName: "orders", NewTableName: "orders_v2",
+	}
+	report := Compute(job)
+
+	if !strings.Contains(report.OperationSummary, "orders_v2") {
+		t.Errorf("expected the summary to mention the new table name, got %q", report.OperationSummary)
+	}
+	if !strings.Contains(report.OperationSummary, "compatibility view") {
+		t.Errorf("expected the summary to mention the compatibility view left under the old name, got %q", report.OperationSummary)
+	}
+}
+
+// TestCompute_AddForeignKey_DirectDDL_HasValidatingStage confirms
+// ADD_FOREIGN_KEY gets the same 3-stage VALIDATING pipeline as
+// SET_NOT_NULL/ADD_CONSTRAINT — it uses the identical NOT VALID +
+// VALIDATE CONSTRAINT mechanism (see executeAddForeignKey's own doc
+// comment), so the same guarantee deserves the same visibility.
+func TestCompute_AddForeignKey_DirectDDL_HasValidatingStage(t *testing.T) {
+	job := &state.Job{ID: "j11f", Strategy: "DIRECT_DDL", Operation: "ADD_FOREIGN_KEY", Phase: state.PhaseCompleted}
+	report := Compute(job)
+
+	if len(report.Stages) != 3 {
+		t.Fatalf("expected a 3-stage pipeline (PREPARATION, VALIDATING, COMPLETED) for ADD_FOREIGN_KEY, got %d stages: %+v", len(report.Stages), report.Stages)
+	}
+	if report.Stages[1].Phase != state.PhaseValidating {
+		t.Errorf("expected stage 1 to be VALIDATING, got %s", report.Stages[1].Phase)
+	}
+}
+
+// TestRender_AddForeignKey_MentionsReferencedTableAndColumn is the
+// direct regression test for Render()'s summary describing WHAT the
+// foreign key actually points at, not just that "a foreign key was
+// added" — a reviewer reading this needs to know the referenced table
+// and column to understand the relationship being enforced.
+func TestRender_AddForeignKey_MentionsReferencedTableAndColumn(t *testing.T) {
+	job := &state.Job{
+		ID: "j11g", Strategy: "DIRECT_DDL", Operation: "ADD_FOREIGN_KEY", Phase: state.PhaseCompleted,
+		SchemaName: "public", TableName: "orders", ColumnName: "customer_id",
+		ConstraintName: "fk_orders_customer", ReferencedTable: "customers", ReferencedColumn: "id",
+		OnDelete: "CASCADE",
+	}
+	report := Compute(job)
+
+	for _, want := range []string{"customer_id", "customers", "id", "CASCADE"} {
+		if !strings.Contains(report.OperationSummary, want) {
+			t.Errorf("expected the summary to mention %q, got %q", want, report.OperationSummary)
+		}
+	}
+}
+
+// TestCompute_AddGeneratedColumn_DirectDDL_UsesTwoStagePipeline confirms
+// the small-table (native GENERATED) path uses the plain 2-stage
+// pipeline — a single ALTER TABLE statement, no separate validation step
+// the way ADD_INDEX/SET_NOT_NULL genuinely have one.
+func TestCompute_AddGeneratedColumn_DirectDDL_UsesTwoStagePipeline(t *testing.T) {
+	job := &state.Job{ID: "j11h", Strategy: "DIRECT_DDL", Operation: "ADD_GENERATED_COLUMN", Phase: state.PhaseCompleted}
+	report := Compute(job)
+
+	if len(report.Stages) != 2 {
+		t.Fatalf("expected the plain 2-stage pipeline for the DIRECT_DDL path, got %d stages: %+v", len(report.Stages), report.Stages)
+	}
+}
+
+// TestCompute_AddGeneratedColumn_ExpandBackfill_UsesFourStagePipeline
+// confirms the large-table (trigger + backfill) path gets the same
+// 4-stage pipeline as ADD_COLUMN's volatile-default backfill and
+// RENAME_COLUMN — see executeAddGeneratedColumnViaBackfill's phase
+// sequence (Preparation -> Syncing -> Validating -> Completed), which
+// this must match.
+func TestCompute_AddGeneratedColumn_ExpandBackfill_UsesFourStagePipeline(t *testing.T) {
+	job := &state.Job{ID: "j11i", Strategy: "EXPAND_BACKFILL", Operation: "ADD_GENERATED_COLUMN", Phase: state.PhaseCompleted}
+	report := Compute(job)
+
+	if len(report.Stages) != 4 {
+		t.Fatalf("expected the 4-stage EXPAND_BACKFILL pipeline, got %d stages: %+v", len(report.Stages), report.Stages)
+	}
+}
+
+// TestRender_AddGeneratedColumn_Direct_MentionsExpressionAndNativeGenerated
+// is the direct regression test for the summary correctly describing
+// the small-table path as a REAL, native generated column.
+func TestRender_AddGeneratedColumn_Direct_MentionsExpressionAndNativeGenerated(t *testing.T) {
+	job := &state.Job{
+		ID: "j11j", Strategy: "DIRECT_DDL", Operation: "ADD_GENERATED_COLUMN", Phase: state.PhaseCompleted,
+		SchemaName: "public", TableName: "orders", ColumnName: "total", ColumnType: "numeric",
+		GeneratedExpression: "price * quantity",
+	}
+	report := Compute(job)
+
+	if !strings.Contains(report.OperationSummary, "price * quantity") {
+		t.Errorf("expected the summary to mention the expression, got %q", report.OperationSummary)
+	}
+	if !strings.Contains(report.OperationSummary, "generated column") {
+		t.Errorf("expected the summary to describe this as a generated column, got %q", report.OperationSummary)
+	}
+}
+
+// TestRender_AddGeneratedColumn_ExpandBackfill_MentionsTriggerNotNative is
+// the direct regression test for the summary being HONEST about the
+// large-table path's real trade-off — it must NOT claim this is a
+// native generated column, since it genuinely isn't one (see
+// executeAddGeneratedColumn's own doc comment for exactly what differs).
+// Misleadingly calling this "generated" the same way the DIRECT_DDL path
+// is described would misrepresent a real behavioral difference (this
+// path silently recomputes on explicit writes rather than rejecting
+// them).
+func TestRender_AddGeneratedColumn_ExpandBackfill_MentionsTriggerNotNative(t *testing.T) {
+	job := &state.Job{
+		ID: "j11k", Strategy: "EXPAND_BACKFILL", Operation: "ADD_GENERATED_COLUMN", Phase: state.PhaseCompleted,
+		SchemaName: "public", TableName: "orders", ColumnName: "total", ColumnType: "numeric",
+		GeneratedExpression: "price * quantity",
+	}
+	report := Compute(job)
+
+	if !strings.Contains(report.OperationSummary, "trigger") {
+		t.Errorf("expected the summary to mention the trigger mechanism, got %q", report.OperationSummary)
+	}
+	if !strings.Contains(report.OperationSummary, "not a native generated column") {
+		t.Errorf("expected the summary to explicitly disclaim being a native generated column, got %q", report.OperationSummary)
+	}
+}
+
 // TestRender_Aborted_DoesNotClaimOrphanCleanupSpecifically is a
 // regression test for the second bug found alongside the pipeline one: a
 // successful, deliberate user Rollback() and internal/reaper's orphan
@@ -608,5 +755,72 @@ func TestCompute_StatementsIsNeverNil(t *testing.T) {
 				t.Error("Statements serialized as JSON null — this is exactly what crashed the frontend (null.length is not a function)")
 			}
 		})
+	}
+}
+
+func TestRender_PartitionTable_MentionsStrategyColumnAndCount(t *testing.T) {
+	job := &state.Job{
+		ID: "j-part-1", Strategy: "SHADOW_TABLE", Operation: "PARTITION_TABLE", Phase: state.PhaseCompleted,
+		SchemaName: "public", TableName: "orders",
+		PartitionColumn: "created_at", PartitionStrategy: "RANGE",
+		PartitionBoundsJSON: `[{"name":"orders_2024_01","from":"2024-01-01","to":"2024-02-01"},{"name":"orders_2024_02","from":"2024-02-01","to":"2024-03-01"}]`,
+	}
+	report := Compute(job)
+
+	for _, want := range []string{"RANGE", "created_at", "2 partitions"} {
+		if !strings.Contains(report.OperationSummary, want) {
+			t.Errorf("expected the summary to mention %q, got %q", want, report.OperationSummary)
+		}
+	}
+}
+
+// TestRender_PartitionTable_SingularWhenOnePartition is the direct
+// regression test for correct pluralization — "1 partitions" would be
+// an obvious, avoidable grammar mistake in a summary a reviewer reads
+// directly.
+func TestRender_PartitionTable_SingularWhenOnePartition(t *testing.T) {
+	job := &state.Job{
+		ID: "j-part-2", Strategy: "SHADOW_TABLE", Operation: "PARTITION_TABLE", Phase: state.PhaseCompleted,
+		SchemaName: "public", TableName: "orders",
+		PartitionColumn: "region", PartitionStrategy: "LIST",
+		PartitionBoundsJSON: `[{"name":"orders_eu","values":["DE","FR"]}]`,
+	}
+	report := Compute(job)
+
+	if !strings.Contains(report.OperationSummary, "1 partition ") {
+		t.Errorf("expected singular '1 partition', got %q", report.OperationSummary)
+	}
+	if strings.Contains(report.OperationSummary, "1 partitions") {
+		t.Errorf("expected singular 'partition', not 'partitions', got %q", report.OperationSummary)
+	}
+}
+
+func TestRender_PartitionTable_MentionsDefaultPartitionWhenIncluded(t *testing.T) {
+	job := &state.Job{
+		ID: "j-part-3", Strategy: "SHADOW_TABLE", Operation: "PARTITION_TABLE", Phase: state.PhaseCompleted,
+		SchemaName: "public", TableName: "orders",
+		PartitionColumn: "region", PartitionStrategy: "LIST",
+		PartitionBoundsJSON:     `[{"name":"orders_eu","values":["DE","FR"]}]`,
+		PartitionIncludeDefault: true,
+	}
+	report := Compute(job)
+
+	if !strings.Contains(report.OperationSummary, "DEFAULT partition") {
+		t.Errorf("expected the summary to mention the DEFAULT partition, got %q", report.OperationSummary)
+	}
+}
+
+// TestCompute_PartitionTable_UsesNineStageShadowTablePipeline confirms
+// PARTITION_TABLE reuses the standard, unmodified 9-stage SHADOW_TABLE
+// pipeline — see internal/shadowflow.prepare's own doc comment for why
+// only the initial CREATE TABLE step differs; every phase transition
+// after that (Syncing, DeltaSync, Validating, Swapping, RollbackWindow,
+// Cleanup) is completely unchanged.
+func TestCompute_PartitionTable_UsesNineStageShadowTablePipeline(t *testing.T) {
+	job := &state.Job{ID: "j-part-4", Strategy: "SHADOW_TABLE", Operation: "PARTITION_TABLE", Phase: state.PhaseCompleted}
+	report := Compute(job)
+
+	if len(report.Stages) != 9 {
+		t.Fatalf("expected the standard 9-stage SHADOW_TABLE pipeline, got %d stages: %+v", len(report.Stages), report.Stages)
 	}
 }

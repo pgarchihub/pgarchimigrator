@@ -54,6 +54,69 @@ const (
 	// is a deliberate, separate, later DROP_COLUMN migration rather than
 	// something this operation does automatically.
 	OpRenameColumn Operation = "RENAME_COLUMN"
+
+	// OpRenameTable, like OpRenameColumn just above, deliberately does
+	// NOT use a plain ALTER TABLE ... RENAME TO on its own — that
+	// statement is metadata-only and instant, but ANY caller (a running
+	// app instance not yet redeployed to the new name) querying the old
+	// name would start failing immediately with "relation does not
+	// exist". This is if anything a MORE severe version of
+	// OpRenameColumn's exact problem, since most queries against a
+	// table reference the table name, where a column rename might only
+	// break queries touching that one column. Instead this renames the
+	// table and leaves a compatibility VIEW under the OLD name selecting
+	// from the new one — see internal/ddlflow.executeRenameTable's doc
+	// comment for why a plain "SELECT * FROM new_table" view is both
+	// sufficient and, for the common case, automatically read/write
+	// updatable by PostgreSQL itself with no extra machinery needed.
+	// Like OpRenameColumn, dropping that compatibility view once every
+	// caller has moved to the new name is a deliberate, separate,
+	// later action this operation does not do automatically.
+	OpRenameTable Operation = "RENAME_TABLE"
+
+	// OpAddForeignKey uses the same NOT VALID + VALIDATE CONSTRAINT
+	// pattern as OpAddConstraint above — PostgreSQL supports this for
+	// foreign keys too, not just CHECK constraints, so this gets the
+	// exact same "instant to add, non-blocking to validate" treatment.
+	// See internal/ddlflow.executeAddForeignKey's doc comment for the
+	// full mechanism and for why the referenced column's own
+	// UNIQUE/PRIMARY KEY requirement doesn't need separate validation
+	// here — PostgreSQL enforces it natively with a clear error if it's
+	// missing.
+	OpAddForeignKey Operation = "ADD_FOREIGN_KEY"
+
+	// OpAddGeneratedColumn is deliberately NOT metadata-only on a large
+	// table the way ADD_COLUMN's constant-default path is — PostgreSQL
+	// requires computing (and storing) every existing row's value for a
+	// GENERATED ALWAYS AS (...) STORED column, which is a full table
+	// rewrite under ACCESS EXCLUSIVE regardless of how "simple" the
+	// expression is. See internal/ddlflow.executeAddGeneratedColumn's
+	// own doc comment for the two-path mechanism this uses to avoid
+	// that rewrite on a large table: a real, native GENERATED column on
+	// a small table (where the rewrite is cheap enough not to matter —
+	// same reasoning as the small-table shortcut in Decide below), or a
+	// plain column kept in sync by a BEFORE INSERT/UPDATE trigger plus
+	// a batched backfill on a large one — behaviorally equivalent, but
+	// not a true native GENERATED column (see that doc comment for what
+	// this trade-off actually costs).
+	OpAddGeneratedColumn Operation = "ADD_GENERATED_COLUMN"
+
+	// OpPartitionTable converts an existing, regular table into a
+	// partitioned one — the hardest operation this package supports.
+	// PostgreSQL has no in-place way to do this: partitioning can only
+	// be declared at CREATE TABLE time, never added to an existing
+	// table via ALTER. This is why OpPartitionTable is the one
+	// operation outside ALTER_COLUMN_TYPE's incompatible-cast case that
+	// can require StrategyShadowTable — see
+	// internal/shadowflow.prepare's own doc comment for the mechanism:
+	// a NEW, genuinely partitioned table is built alongside the
+	// original, kept in sync via the same logical-replication pipeline
+	// SHADOW_TABLE already uses for ALTER_COLUMN_TYPE, then swapped in
+	// atomically. Everything downstream of table creation (dependent
+	// objects, publication, replication slot, sync engine, validation,
+	// swap) is reused unchanged; only the initial CREATE TABLE
+	// statement differs.
+	OpPartitionTable Operation = "PARTITION_TABLE"
 )
 
 // Strategy tells the orchestrator which flow to run.
@@ -109,6 +172,92 @@ type ColumnChange struct {
 	// EXISTING (old) name, NewColumnName holds the name it's being
 	// renamed to. Both are required.
 	NewColumnName string
+
+	// NewTableName is used ONLY by RENAME_TABLE — the table being
+	// renamed is the request's own TableName (see
+	// orchestrator.MigrationRequest), this field holds the name it's
+	// being renamed to. Required; there is no column involved at all
+	// for this operation (see NewMigration.tsx's isReadyForPreview,
+	// which correctly doesn't require a Column field for this one
+	// operation, unlike every other operation this package supports).
+	NewTableName string
+
+	// The fields below are used ONLY by ADD_FOREIGN_KEY. ColumnName
+	// (already defined above) holds the LOCAL column the foreign key is
+	// added to; ConstraintName (already defined above, shared with
+	// ADD_CONSTRAINT) holds the new constraint's name.
+	//
+	// ReferencedTable/ReferencedColumn are both required — the table
+	// and column the foreign key points at. Assumed to be in the SAME
+	// schema as the table being modified; a genuinely cross-schema
+	// foreign key isn't supported via a dedicated field in this
+	// version.
+	ReferencedTable  string
+	ReferencedColumn string
+	// OnDelete is optional — one of "CASCADE", "SET NULL", "SET
+	// DEFAULT", "RESTRICT", "NO ACTION" (validated against exactly this
+	// allow-list, not PostgreSQL's own general expression grammar,
+	// since this is a closed set of literal keyword phrases, not an
+	// arbitrary expression — see ValidateOnDeleteAction). Empty means
+	// PostgreSQL's own default, NO ACTION.
+	OnDelete string
+	// GeneratedExpression is used ONLY by ADD_GENERATED_COLUMN — the
+	// expression the new column's value is computed from (e.g. "price *
+	// quantity"), evaluated against the OTHER columns of the same row.
+	// ColumnName/NewType (already defined above) hold the new column's
+	// name/type, same fields ADD_COLUMN uses. Subject to the same
+	// SQL-injection blocklist as DefaultValue/CheckExpression — see
+	// ValidateSQLExpression — since, like those two fields, it's
+	// inlined directly into DDL text (PostgreSQL doesn't support
+	// parameter binding inside ALTER TABLE), not a plain identifier.
+	GeneratedExpression string
+
+	// The four fields below are used ONLY by PARTITION_TABLE.
+	//
+	// PartitionColumn is the column values are partitioned on.
+	// PartitionStrategy is "RANGE" or "LIST" (PostgreSQL's own two most
+	// common partitioning strategies — HASH isn't supported by this
+	// version, since it doesn't fit the "shrink one huge table by a
+	// meaningful key" use case this operation targets).
+	//
+	// PartitionBoundsJSON is a JSON-encoded array of the ACTUAL,
+	// EXPLICIT partition definitions — always fully expanded by the
+	// time a request reaches this struct, REGARDLESS of whether the
+	// caller originally specified them explicitly or via the
+	// convenience rule-based generator (see ExpandPartitionRule) — a
+	// deliberate design choice so internal/ddlflow/internal/shadowflow
+	// never need to know "rules" exist at all, only ever handling one,
+	// simpler, already-expanded shape. Each element has the shape
+	// {"name": "...", "from": "...", "to": "..."} for RANGE or
+	// {"name": "...", "values": ["...", "..."]} for LIST — see
+	// PartitionBound.
+	PartitionColumn     string
+	PartitionStrategy   string
+	PartitionBoundsJSON string
+	// PartitionIncludeDefault adds a DEFAULT partition catching any row
+	// that doesn't match one of the explicit bounds — PostgreSQL
+	// requires either a DEFAULT partition or genuinely exhaustive
+	// coverage; without one, an out-of-range/unlisted value at
+	// migration time (or from a future write) would simply fail to
+	// insert. Recommended unless the caller is certain their bounds are
+	// exhaustive.
+	PartitionIncludeDefault bool
+}
+
+// PartitionBound is one partition's boundary definition — see
+// ColumnChange.PartitionBoundsJSON's own doc comment for the two JSON
+// shapes this takes depending on PartitionStrategy. Name becomes the
+// actual partition table's name (schema-qualified, quoted the same way
+// every other identifier in this project is).
+type PartitionBound struct {
+	Name string `json:"name"`
+	// RANGE only — PostgreSQL parses these contextually against the
+	// partition column's actual type (a date, a number, etc.), so they
+	// stay plain strings here rather than a typed Go value.
+	From string `json:"from,omitempty"`
+	To   string `json:"to,omitempty"`
+	// LIST only — the explicit set of values this partition holds.
+	Values []string `json:"values,omitempty"`
 }
 
 const smallTableRowThreshold = 1_000_000 // FR-01: < 1M rows -> small table
@@ -140,14 +289,18 @@ const smallTableRowThreshold = 1_000_000 // FR-01: < 1M rows -> small table
 // possible failure mode for a tool whose entire value proposition is
 // "you can trust what this says happened."
 var validStrategiesByOperation = map[Operation][]Strategy{
-	OpAddColumn:     {StrategyDirectDDL, StrategyExpandBackfill},
-	OpDropColumn:    {StrategyDirectDDL},
-	OpAddIndex:      {StrategyDirectDDL},
-	OpDropIndex:     {StrategyDirectDDL},
-	OpSetNotNull:    {StrategyDirectDDL},
-	OpAddConstraint: {StrategyDirectDDL},
-	OpRenameColumn:  {StrategyExpandBackfill},
-	OpAlterType:     {StrategyDirectDDL, StrategyShadowTable},
+	OpAddColumn:          {StrategyDirectDDL, StrategyExpandBackfill},
+	OpDropColumn:         {StrategyDirectDDL},
+	OpAddIndex:           {StrategyDirectDDL},
+	OpDropIndex:          {StrategyDirectDDL},
+	OpSetNotNull:         {StrategyDirectDDL},
+	OpAddConstraint:      {StrategyDirectDDL},
+	OpRenameColumn:       {StrategyExpandBackfill},
+	OpRenameTable:        {StrategyDirectDDL},
+	OpAddForeignKey:      {StrategyDirectDDL},
+	OpAddGeneratedColumn: {StrategyDirectDDL, StrategyExpandBackfill},
+	OpPartitionTable:     {StrategyShadowTable},
+	OpAlterType:          {StrategyDirectDDL, StrategyShadowTable},
 }
 
 // ValidStrategiesFor returns the strategies operation can actually be
@@ -204,6 +357,19 @@ func Decide(stats TableStats, change ColumnChange, override Strategy) (Strategy,
 		return override, nil
 	}
 
+	// PARTITION_TABLE is the one operation exempt from the small-table
+	// shortcut just below — unlike every other operation here,
+	// PostgreSQL has NO direct-DDL mechanism for converting a table
+	// into a partitioned one at ANY size (see OpPartitionTable's own
+	// doc comment), so this always needs the shadow-table + logical
+	// replication mechanism, table size notwithstanding.
+	if change.Operation == OpPartitionTable {
+		if !stats.HasPrimaryKey {
+			return "", fmt.Errorf("shadow table strategy requires a PRIMARY KEY / REPLICA IDENTITY (Architecture Doc 3.2): %s.%s", stats.SchemaName, stats.TableName)
+		}
+		return StrategyShadowTable, nil
+	}
+
 	// Small table: not worth the shadow-table overhead (Section 4.0, last row).
 	if stats.EstimatedRowCount < smallTableRowThreshold {
 		return StrategyDirectDDL, nil
@@ -231,6 +397,23 @@ func Decide(stats TableStats, change ColumnChange, override Strategy) (Strategy,
 		// ADD_INDEX/DROP_INDEX above.
 		return StrategyDirectDDL, nil
 
+	case OpAddForeignKey:
+		// Same NOT VALID + VALIDATE CONSTRAINT mechanism as
+		// SET_NOT_NULL/ADD_CONSTRAINT just above — PostgreSQL supports
+		// it for foreign keys too, so this needs neither
+		// EXPAND_BACKFILL nor SHADOW_TABLE regardless of table size.
+		return StrategyDirectDDL, nil
+
+	case OpAddGeneratedColumn:
+		// Unlike ADD_COLUMN, there is no "cheap, metadata-only" variant
+		// here even for a large table — see OpAddGeneratedColumn's own
+		// doc comment for why a STORED generated column always
+		// requires computing every existing row's value. The
+		// small-table shortcut above already handles the case where
+		// that computation is cheap enough not to matter; this branch
+		// only runs for tables where it genuinely isn't.
+		return StrategyExpandBackfill, nil
+
 	case OpRenameColumn:
 		// Unlike ADD_INDEX/SET_NOT_NULL, this genuinely needs an
 		// application-level batched backfill (syncing the new column from
@@ -238,6 +421,14 @@ func Decide(stats TableStats, change ColumnChange, override Strategy) (Strategy,
 		// primitive — the same mechanism ADD_COLUMN's volatile-default
 		// path uses, so it gets the same strategy label.
 		return StrategyExpandBackfill, nil
+
+	case OpRenameTable:
+		// Unlike OpRenameColumn, this doesn't need row-by-row batched
+		// sync at all — RENAME TO plus a single CREATE VIEW are both
+		// instant, metadata-level operations regardless of table size,
+		// so this needs neither EXPAND_BACKFILL's batching machinery nor
+		// SHADOW_TABLE's logical replication.
+		return StrategyDirectDDL, nil
 
 	case OpAlterType:
 		if change.TypeConversionCompatible {

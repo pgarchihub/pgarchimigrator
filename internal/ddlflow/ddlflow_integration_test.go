@@ -1397,3 +1397,819 @@ func TestRollback_RenameColumn_DropsNewColumnAndTrigger(t *testing.T) {
 		t.Errorf("expected the original 3 rows to be preserved, got %d", rowCount)
 	}
 }
+
+func TestExecute_RenameTable_RenamesAndCreatesCompatibilityView(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	tableName := "ddlflow_rename_table_test"
+	newTableName := "ddlflow_rename_table_test_v2"
+	createTestTable(t, pool, tableName, 3)
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "rename-table-job-1", SchemaName: "public", TableName: tableName,
+		Strategy: "DIRECT_DDL", Phase: state.PhasePreflight,
+		Operation: "RENAME_TABLE", NewTableName: newTableName,
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP VIEW IF EXISTS %s`, tableName))
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s`, newTableName))
+	})
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if job.Phase != state.PhaseCompleted {
+		t.Errorf("expected Phase=COMPLETED, got %s", job.Phase)
+	}
+
+	var newTableExists bool
+	tableQuery := `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)`
+	if err := pool.QueryRow(ctx, tableQuery, newTableName).Scan(&newTableExists); err != nil {
+		t.Fatalf("table check failed: %v", err)
+	}
+	if !newTableExists {
+		t.Error("expected the table to actually exist under the new name")
+	}
+
+	var oldNameIsView bool
+	viewQuery := `SELECT EXISTS (SELECT 1 FROM information_schema.views WHERE table_schema = 'public' AND table_name = $1)`
+	if err := pool.QueryRow(ctx, viewQuery, tableName).Scan(&oldNameIsView); err != nil {
+		t.Fatalf("view check failed: %v", err)
+	}
+	if !oldNameIsView {
+		t.Error("expected a compatibility view to exist under the old name")
+	}
+}
+
+// TestExecute_RenameTable_OldNameStillWorks_ForReadsAndWrites is the
+// direct regression test for the whole reason executeRenameTable creates
+// a view instead of doing a plain, instant ALTER TABLE RENAME — see
+// strategy.OpRenameTable's own doc comment. A plain "SELECT * FROM
+// new_table" view (no joins/aggregates/DISTINCT/GROUP BY) is
+// automatically updatable by PostgreSQL itself with no extra machinery,
+// so this confirms both SELECT and INSERT genuinely pass through
+// transparently — not just that the view object exists.
+func TestExecute_RenameTable_OldNameStillWorks_ForReadsAndWrites(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	tableName := "ddlflow_rename_table_oldname_test"
+	newTableName := "ddlflow_rename_table_oldname_test_v2"
+	createTestTable(t, pool, tableName, 0)
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "rename-table-oldname-job-1", SchemaName: "public", TableName: tableName,
+		Strategy: "DIRECT_DDL", Phase: state.PhasePreflight,
+		Operation: "RENAME_TABLE", NewTableName: newTableName,
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP VIEW IF EXISTS %s`, tableName))
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s`, newTableName))
+	})
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	// Simulate legacy application code: an INSERT against the OLD table
+	// name, exactly as it would have written before this migration ever
+	// ran.
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (existing_col) VALUES ('legacy-write')`, tableName)); err != nil {
+		t.Fatalf("legacy-style INSERT through the compatibility view failed: %v", err)
+	}
+
+	// Read the row back through the NEW name — proves the write really
+	// landed in the renamed table, not just in some disconnected view.
+	var readViaNewName string
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT existing_col FROM %s WHERE existing_col = 'legacy-write'`, newTableName)).Scan(&readViaNewName); err != nil {
+		t.Fatalf("could not read the legacy write back via the new table name: %v", err)
+	}
+	if readViaNewName != "legacy-write" {
+		t.Errorf("expected 'legacy-write', got %q", readViaNewName)
+	}
+
+	// And a SELECT through the OLD name too — the view must also serve
+	// reads, not just accept writes.
+	var readViaOldName string
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT existing_col FROM %s WHERE existing_col = 'legacy-write'`, tableName)).Scan(&readViaOldName); err != nil {
+		t.Fatalf("could not read the row back through the old-name compatibility view: %v", err)
+	}
+	if readViaOldName != "legacy-write" {
+		t.Errorf("expected 'legacy-write' via the old name too, got %q", readViaOldName)
+	}
+}
+
+func TestExecute_RenameTable_MissingNewTableName_Fails(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	tableName := "ddlflow_rename_table_missing_test"
+	createTestTable(t, pool, tableName, 0)
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "rename-table-missing-job-1", SchemaName: "public", TableName: tableName,
+		Strategy: "DIRECT_DDL", Phase: state.PhasePreflight,
+		Operation: "RENAME_TABLE", // NewTableName deliberately left empty
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+
+	if err := flow.Execute(ctx, job); err == nil {
+		t.Fatal("expected Execute to fail for a missing new table name")
+	}
+	if job.Phase != state.PhaseFailed {
+		t.Errorf("expected Phase=FAILED, got %s", job.Phase)
+	}
+}
+
+// TestRollback_RenameTable_CompletedJob_Refuses is the direct
+// regression test for rollbackRenameTable's safety guard — see its own
+// doc comment for why this mirrors rollbackAddColumn's identical
+// caution: application code may already be using the new table name
+// directly by the time a RENAME_TABLE job is COMPLETED.
+func TestRollback_RenameTable_CompletedJob_Refuses(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	tableName := "ddlflow_rename_table_rollback_refuse_test"
+	newTableName := "ddlflow_rename_table_rollback_refuse_test_v2"
+	createTestTable(t, pool, tableName, 0)
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "rename-table-rollback-refuse-job-1", SchemaName: "public", TableName: tableName,
+		Strategy: "DIRECT_DDL", Phase: state.PhasePreflight,
+		Operation: "RENAME_TABLE", NewTableName: newTableName,
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP VIEW IF EXISTS %s`, tableName))
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s`, newTableName))
+	})
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if job.Phase != state.PhaseCompleted {
+		t.Fatalf("expected Phase=COMPLETED before testing rollback refusal, got %s", job.Phase)
+	}
+
+	if err := flow.Rollback(ctx, job); err == nil {
+		t.Fatal("expected Rollback to refuse a COMPLETED RENAME_TABLE job")
+	}
+	if job.Phase != state.PhaseCompleted {
+		t.Errorf("expected Phase to remain COMPLETED after a refused rollback, got %s", job.Phase)
+	}
+}
+
+// TestRollback_RenameTable_InProgress_RestoresOriginalName confirms
+// rollback DOES work (and is genuinely useful) for a job that failed
+// before reaching COMPLETED — the compatibility view is dropped and the
+// table is renamed back, leaving the database exactly as it was before
+// this migration ever ran.
+func TestRollback_RenameTable_InProgress_RestoresOriginalName(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	tableName := "ddlflow_rename_table_rollback_ok_test"
+	newTableName := "ddlflow_rename_table_rollback_ok_test_v2"
+	createTestTable(t, pool, tableName, 2)
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "rename-table-rollback-ok-job-1", SchemaName: "public", TableName: tableName,
+		Strategy: "DIRECT_DDL", Phase: state.PhasePreflight,
+		Operation: "RENAME_TABLE", NewTableName: newTableName,
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP VIEW IF EXISTS %s`, tableName))
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s`, newTableName))
+	})
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	// Force the job back to a non-terminal phase to simulate rolling
+	// back before completion — Rollback's safety guard only inspects
+	// job.Phase, not whether the underlying DDL already ran.
+	job.Phase = state.PhaseSyncing
+
+	if err := flow.Rollback(ctx, job); err != nil {
+		t.Fatalf("Rollback failed: %v", err)
+	}
+	if job.Phase != state.PhaseAborted {
+		t.Errorf("expected Phase=ABORTED after rollback, got %s", job.Phase)
+	}
+
+	var oldTableExists bool
+	tableQuery := `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)`
+	if err := pool.QueryRow(ctx, tableQuery, tableName).Scan(&oldTableExists); err != nil {
+		t.Fatalf("table check failed: %v", err)
+	}
+	if !oldTableExists {
+		t.Error("expected the table to exist under its ORIGINAL name again after rollback")
+	}
+
+	var newNameExists bool
+	if err := pool.QueryRow(ctx, tableQuery, newTableName).Scan(&newNameExists); err != nil {
+		t.Fatalf("new-name existence check failed: %v", err)
+	}
+	if newNameExists {
+		t.Error("expected nothing left under the new name after rollback")
+	}
+
+	var rowCount int
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, tableName)).Scan(&rowCount); err != nil {
+		t.Fatalf("could not count rows: %v", err)
+	}
+	if rowCount != 2 {
+		t.Errorf("expected the original 2 rows to be preserved through rollback, got %d", rowCount)
+	}
+}
+
+// setupForeignKeyTestTables creates a "referenced" table (with a primary
+// key) and a "local" table with a bigint column meant to reference it —
+// the minimal two-table shape ADD_FOREIGN_KEY tests need, since (unlike
+// every other operation tested in this file) it genuinely spans two
+// tables, not one.
+func setupForeignKeyTestTables(t *testing.T, pool *pgxpool.Pool, referencedTable, localTable string) {
+	t.Helper()
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, localTable)); err != nil {
+		t.Fatalf("could not clean up old local table: %v", err)
+	}
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, referencedTable)); err != nil {
+		t.Fatalf("could not clean up old referenced table: %v", err)
+	}
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s (id BIGINT PRIMARY KEY)`, referencedTable)); err != nil {
+		t.Fatalf("could not create referenced table: %v", err)
+	}
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, ref_id BIGINT)`, localTable)); err != nil {
+		t.Fatalf("could not create local table: %v", err)
+	}
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (id) VALUES (1), (2), (3)`, referencedTable)); err != nil {
+		t.Fatalf("could not seed referenced table: %v", err)
+	}
+}
+
+func TestExecute_AddForeignKey_Succeeds(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	referencedTable := "ddlflow_fk_referenced_test"
+	localTable := "ddlflow_fk_local_test"
+	setupForeignKeyTestTables(t, pool, referencedTable, localTable)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, localTable))
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, referencedTable))
+	})
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (ref_id) VALUES (1), (2)`, localTable)); err != nil {
+		t.Fatalf("could not seed local table: %v", err)
+	}
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "addfk-job-1", SchemaName: "public", TableName: localTable,
+		Strategy: "DIRECT_DDL", Phase: state.PhasePreflight,
+		Operation: "ADD_FOREIGN_KEY", ColumnName: "ref_id", ConstraintName: "fk_local_ref",
+		ReferencedTable: referencedTable, ReferencedColumn: "id",
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if job.Phase != state.PhaseCompleted {
+		t.Errorf("expected Phase=COMPLETED, got %s", job.Phase)
+	}
+
+	var valid bool
+	checkQuery := `SELECT convalidated FROM pg_constraint WHERE conname = $1`
+	if err := pool.QueryRow(ctx, checkQuery, job.ConstraintName).Scan(&valid); err != nil {
+		t.Fatalf("constraint check failed: %v", err)
+	}
+	if !valid {
+		t.Error("expected the foreign key to be validated (convalidated=true)")
+	}
+}
+
+// TestExecute_AddForeignKey_FailsOnViolatingRow verifies validation
+// catches an existing row whose ref_id doesn't actually exist in the
+// referenced table, and cleans up rather than leaving a permanently-
+// invalid constraint behind — same reasoning as
+// TestExecute_AddConstraint_FailsOnViolatingRow.
+func TestExecute_AddForeignKey_FailsOnViolatingRow(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	referencedTable := "ddlflow_fk_referenced_fail_test"
+	localTable := "ddlflow_fk_local_fail_test"
+	setupForeignKeyTestTables(t, pool, referencedTable, localTable)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, localTable))
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, referencedTable))
+	})
+	// 999 does not exist in the referenced table — a genuine referential
+	// integrity violation the VALIDATE step must catch.
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (ref_id) VALUES (999)`, localTable)); err != nil {
+		t.Fatalf("could not seed a violating row: %v", err)
+	}
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "addfk-fail-job-1", SchemaName: "public", TableName: localTable,
+		Strategy: "DIRECT_DDL", Phase: state.PhasePreflight,
+		Operation: "ADD_FOREIGN_KEY", ColumnName: "ref_id", ConstraintName: "fk_local_ref_fail",
+		ReferencedTable: referencedTable, ReferencedColumn: "id",
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+
+	if err := flow.Execute(ctx, job); err == nil {
+		t.Fatal("expected Execute to fail due to a row referencing a nonexistent value")
+	}
+	if job.Phase != state.PhaseFailed {
+		t.Errorf("expected Phase=FAILED, got %s", job.Phase)
+	}
+
+	var constraintExists bool
+	constraintQuery := `SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname = $1)`
+	if err := pool.QueryRow(ctx, constraintQuery, job.ConstraintName).Scan(&constraintExists); err != nil {
+		t.Fatalf("constraint check failed: %v", err)
+	}
+	if constraintExists {
+		t.Error("expected the failed foreign key to have been cleaned up, not left behind")
+	}
+}
+
+// TestExecute_AddForeignKey_OnDeleteCascade_ActuallyCascades is the
+// direct regression test for the ON DELETE clause genuinely being wired
+// into the generated DDL, not just accepted and silently ignored —
+// deletes a row in the referenced table and confirms the dependent row
+// in the local table is genuinely cascade-deleted too.
+func TestExecute_AddForeignKey_OnDeleteCascade_ActuallyCascades(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	referencedTable := "ddlflow_fk_referenced_cascade_test"
+	localTable := "ddlflow_fk_local_cascade_test"
+	setupForeignKeyTestTables(t, pool, referencedTable, localTable)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, localTable))
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, referencedTable))
+	})
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (ref_id) VALUES (1)`, localTable)); err != nil {
+		t.Fatalf("could not seed local table: %v", err)
+	}
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "addfk-cascade-job-1", SchemaName: "public", TableName: localTable,
+		Strategy: "DIRECT_DDL", Phase: state.PhasePreflight,
+		Operation: "ADD_FOREIGN_KEY", ColumnName: "ref_id", ConstraintName: "fk_local_ref_cascade",
+		ReferencedTable: referencedTable, ReferencedColumn: "id", OnDelete: "CASCADE",
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE id = 1`, referencedTable)); err != nil {
+		t.Fatalf("could not delete the referenced row: %v", err)
+	}
+
+	var remaining int
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s WHERE ref_id = 1`, localTable)).Scan(&remaining); err != nil {
+		t.Fatalf("could not count remaining local rows: %v", err)
+	}
+	if remaining != 0 {
+		t.Errorf("expected ON DELETE CASCADE to have removed the dependent row, but %d remain", remaining)
+	}
+}
+
+func TestExecute_AddForeignKey_MissingReferencedTable_Fails(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	localTable := "ddlflow_fk_missing_test"
+	createTestTable(t, pool, localTable, 0)
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "addfk-missing-job-1", SchemaName: "public", TableName: localTable,
+		Strategy: "DIRECT_DDL", Phase: state.PhasePreflight,
+		Operation: "ADD_FOREIGN_KEY", ColumnName: "existing_col", ConstraintName: "fk_missing",
+		// ReferencedTable/ReferencedColumn deliberately left empty.
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+
+	if err := flow.Execute(ctx, job); err == nil {
+		t.Fatal("expected Execute to fail for a missing referenced table/column")
+	}
+	if job.Phase != state.PhaseFailed {
+		t.Errorf("expected Phase=FAILED, got %s", job.Phase)
+	}
+}
+
+// TestRollback_AddForeignKey_DropsConstraint verifies rollback works
+// even well after COMPLETED — see rollbackAddForeignKey's own doc
+// comment for why this is safe at any time, unlike
+// rollbackRenameTable's COMPLETED refusal.
+func TestRollback_AddForeignKey_DropsConstraint(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	referencedTable := "ddlflow_fk_referenced_rollback_test"
+	localTable := "ddlflow_fk_local_rollback_test"
+	setupForeignKeyTestTables(t, pool, referencedTable, localTable)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, localTable))
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, referencedTable))
+	})
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "addfk-rollback-job-1", SchemaName: "public", TableName: localTable,
+		Strategy: "DIRECT_DDL", Phase: state.PhasePreflight,
+		Operation: "ADD_FOREIGN_KEY", ColumnName: "ref_id", ConstraintName: "fk_local_ref_rollback",
+		ReferencedTable: referencedTable, ReferencedColumn: "id",
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if job.Phase != state.PhaseCompleted {
+		t.Fatalf("expected Phase=COMPLETED before testing rollback, got %s", job.Phase)
+	}
+
+	if err := flow.Rollback(ctx, job); err != nil {
+		t.Fatalf("Rollback failed (should succeed even after COMPLETED for ADD_FOREIGN_KEY): %v", err)
+	}
+	if job.Phase != state.PhaseAborted {
+		t.Errorf("expected Phase=ABORTED, got %s", job.Phase)
+	}
+
+	var constraintExists bool
+	constraintQuery := `SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname = $1)`
+	if err := pool.QueryRow(ctx, constraintQuery, job.ConstraintName).Scan(&constraintExists); err != nil {
+		t.Fatalf("constraint check failed: %v", err)
+	}
+	if constraintExists {
+		t.Error("expected the foreign key to have been dropped by rollback")
+	}
+}
+
+// setupGeneratedColumnTestTable creates a simple two-numeric-column table
+// (price, quantity) ADD_GENERATED_COLUMN tests compute a "total" column
+// from.
+func setupGeneratedColumnTestTable(t *testing.T, pool *pgxpool.Pool, tableName string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName)); err != nil {
+		t.Fatalf("could not clean up old table: %v", err)
+	}
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, price NUMERIC NOT NULL, quantity NUMERIC NOT NULL)`, tableName)); err != nil {
+		t.Fatalf("could not create test table: %v", err)
+	}
+}
+
+// TestExecute_AddGeneratedColumn_Direct_CreatesRealNativeGeneratedColumn
+// is the direct regression test for the small-table path producing a
+// GENUINE, native PostgreSQL generated column — not the trigger-based
+// simulation the large-table path uses. Confirms both that existing
+// rows get the computed value AND that PostgreSQL itself rejects an
+// explicit write to the column (the real GENERATED behavior the
+// trigger-based path does NOT replicate — see
+// executeAddGeneratedColumn's own doc comment).
+func TestExecute_AddGeneratedColumn_Direct_CreatesRealNativeGeneratedColumn(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	tableName := "ddlflow_gencol_direct_test"
+	setupGeneratedColumnTestTable(t, pool, tableName)
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName)) })
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (price, quantity) VALUES (10, 3)`, tableName)); err != nil {
+		t.Fatalf("could not seed a row: %v", err)
+	}
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "gencol-direct-job-1", SchemaName: "public", TableName: tableName,
+		Strategy: "DIRECT_DDL", Phase: state.PhasePreflight,
+		Operation: "ADD_GENERATED_COLUMN", ColumnName: "total", ColumnType: "numeric",
+		GeneratedExpression: "price * quantity",
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if job.Phase != state.PhaseCompleted {
+		t.Errorf("expected Phase=COMPLETED, got %s", job.Phase)
+	}
+
+	var total float64
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT total FROM %s LIMIT 1`, tableName)).Scan(&total); err != nil {
+		t.Fatalf("could not read the generated column: %v", err)
+	}
+	if total != 30 {
+		t.Errorf("expected total=30 (10*3), got %v", total)
+	}
+
+	// A REAL generated column rejects an explicit write — PostgreSQL's
+	// own enforcement, not something this tool implements itself. If
+	// this INSERT unexpectedly SUCCEEDS, the column isn't actually a
+	// native generated column.
+	_, err := pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (price, quantity, total) VALUES (1, 1, 999)`, tableName))
+	if err == nil {
+		t.Error("expected PostgreSQL to reject an explicit write to a real generated column, but it succeeded")
+	}
+}
+
+// TestExecute_AddGeneratedColumn_ExpandBackfill_BackfillsExistingRows
+// verifies the large-table path correctly backfills rows that existed
+// before the migration ran.
+func TestExecute_AddGeneratedColumn_ExpandBackfill_BackfillsExistingRows(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	tableName := "ddlflow_gencol_backfill_test"
+	setupGeneratedColumnTestTable(t, pool, tableName)
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName)) })
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (price, quantity) VALUES (10, 3), (5, 4)`, tableName)); err != nil {
+		t.Fatalf("could not seed rows: %v", err)
+	}
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "gencol-backfill-job-1", SchemaName: "public", TableName: tableName,
+		Strategy: "EXPAND_BACKFILL", Phase: state.PhasePreflight,
+		Operation: "ADD_GENERATED_COLUMN", ColumnName: "total", ColumnType: "numeric",
+		GeneratedExpression: "price * quantity",
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if job.Phase != state.PhaseCompleted {
+		t.Errorf("expected Phase=COMPLETED, got %s", job.Phase)
+	}
+
+	rows, err := pool.Query(ctx, fmt.Sprintf(`SELECT total FROM %s ORDER BY total`, tableName))
+	if err != nil {
+		t.Fatalf("could not read backfilled values: %v", err)
+	}
+	defer rows.Close()
+	var totals []float64
+	for rows.Next() {
+		var v float64
+		if err := rows.Scan(&v); err != nil {
+			t.Fatalf("scan failed: %v", err)
+		}
+		totals = append(totals, v)
+	}
+	if len(totals) != 2 || totals[0] != 20 || totals[1] != 30 {
+		t.Errorf("expected backfilled totals [20, 30], got %v", totals)
+	}
+}
+
+// TestExecute_AddGeneratedColumn_ExpandBackfill_TriggerSyncsNewInserts
+// is the direct regression test for the trigger mechanism's whole
+// purpose: a row inserted AFTER the migration completes must
+// automatically get the computed value, exactly matching how a real
+// generated column would behave for new rows.
+func TestExecute_AddGeneratedColumn_ExpandBackfill_TriggerSyncsNewInserts(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	tableName := "ddlflow_gencol_trigger_insert_test"
+	setupGeneratedColumnTestTable(t, pool, tableName)
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName)) })
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "gencol-trigger-insert-job-1", SchemaName: "public", TableName: tableName,
+		Strategy: "EXPAND_BACKFILL", Phase: state.PhasePreflight,
+		Operation: "ADD_GENERATED_COLUMN", ColumnName: "total", ColumnType: "numeric",
+		GeneratedExpression: "price * quantity",
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	// A brand new row, inserted well after the migration — matching what
+	// application code (unaware of any migration internals) would do.
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (price, quantity) VALUES (7, 6)`, tableName)); err != nil {
+		t.Fatalf("could not insert a new row: %v", err)
+	}
+
+	var total float64
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT total FROM %s WHERE price = 7`, tableName)).Scan(&total); err != nil {
+		t.Fatalf("could not read the new row's computed total: %v", err)
+	}
+	if total != 42 {
+		t.Errorf("expected the trigger to compute total=42 (7*6) on INSERT, got %v", total)
+	}
+}
+
+// TestExecute_AddGeneratedColumn_ExpandBackfill_TriggerSyncsUpdates is
+// the direct regression test for the trigger recomputing the value when
+// an UPDATE changes one of the columns the expression depends on — not
+// just on INSERT.
+func TestExecute_AddGeneratedColumn_ExpandBackfill_TriggerSyncsUpdates(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	tableName := "ddlflow_gencol_trigger_update_test"
+	setupGeneratedColumnTestTable(t, pool, tableName)
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName)) })
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (price, quantity) VALUES (10, 3)`, tableName)); err != nil {
+		t.Fatalf("could not seed a row: %v", err)
+	}
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "gencol-trigger-update-job-1", SchemaName: "public", TableName: tableName,
+		Strategy: "EXPAND_BACKFILL", Phase: state.PhasePreflight,
+		Operation: "ADD_GENERATED_COLUMN", ColumnName: "total", ColumnType: "numeric",
+		GeneratedExpression: "price * quantity",
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`UPDATE %s SET quantity = 9`, tableName)); err != nil {
+		t.Fatalf("could not update the row: %v", err)
+	}
+
+	var total float64
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT total FROM %s LIMIT 1`, tableName)).Scan(&total); err != nil {
+		t.Fatalf("could not read the recomputed total: %v", err)
+	}
+	if total != 90 {
+		t.Errorf("expected the trigger to recompute total=90 (10*9) on UPDATE, got %v", total)
+	}
+}
+
+func TestExecute_AddGeneratedColumn_MissingExpression_Fails(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	tableName := "ddlflow_gencol_missing_test"
+	setupGeneratedColumnTestTable(t, pool, tableName)
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName)) })
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "gencol-missing-job-1", SchemaName: "public", TableName: tableName,
+		Strategy: "DIRECT_DDL", Phase: state.PhasePreflight,
+		Operation: "ADD_GENERATED_COLUMN", ColumnName: "total", ColumnType: "numeric",
+		// GeneratedExpression deliberately left empty.
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+
+	if err := flow.Execute(ctx, job); err == nil {
+		t.Fatal("expected Execute to fail for a missing generated expression")
+	}
+	if job.Phase != state.PhaseFailed {
+		t.Errorf("expected Phase=FAILED, got %s", job.Phase)
+	}
+}
+
+// TestRollback_AddGeneratedColumn_CompletedJob_Refuses is the direct
+// regression test for rollbackAddGeneratedColumn's safety guard — same
+// reasoning as rollbackAddColumn's identical refusal: application code
+// may already be reading this column by the time the job is COMPLETED.
+func TestRollback_AddGeneratedColumn_CompletedJob_Refuses(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	tableName := "ddlflow_gencol_rollback_refuse_test"
+	setupGeneratedColumnTestTable(t, pool, tableName)
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName)) })
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "gencol-rollback-refuse-job-1", SchemaName: "public", TableName: tableName,
+		Strategy: "DIRECT_DDL", Phase: state.PhasePreflight,
+		Operation: "ADD_GENERATED_COLUMN", ColumnName: "total", ColumnType: "numeric",
+		GeneratedExpression: "price * quantity",
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if job.Phase != state.PhaseCompleted {
+		t.Fatalf("expected Phase=COMPLETED before testing rollback refusal, got %s", job.Phase)
+	}
+
+	if err := flow.Rollback(ctx, job); err == nil {
+		t.Fatal("expected Rollback to refuse a COMPLETED ADD_GENERATED_COLUMN job")
+	}
+	if job.Phase != state.PhaseCompleted {
+		t.Errorf("expected Phase to remain COMPLETED after a refused rollback, got %s", job.Phase)
+	}
+}
+
+// TestRollback_AddGeneratedColumn_ExpandBackfill_InProgress_DropsTriggerAndColumn
+// confirms rollback works for an in-progress large-table job — the
+// trigger, its function, and the column must all be gone afterward.
+func TestRollback_AddGeneratedColumn_ExpandBackfill_InProgress_DropsTriggerAndColumn(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+	tableName := "ddlflow_gencol_rollback_ok_test"
+	setupGeneratedColumnTestTable(t, pool, tableName)
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName)) })
+
+	store := newTestStore(t)
+	flow := ddlflow.New(pool, store)
+
+	job := &state.Job{
+		ID: "gencol-rollback-ok-job-1", SchemaName: "public", TableName: tableName,
+		Strategy: "EXPAND_BACKFILL", Phase: state.PhasePreflight,
+		Operation: "ADD_GENERATED_COLUMN", ColumnName: "total", ColumnType: "numeric",
+		GeneratedExpression: "price * quantity",
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	job.Phase = state.PhaseSyncing // simulate rolling back before completion
+
+	if err := flow.Rollback(ctx, job); err != nil {
+		t.Fatalf("Rollback failed: %v", err)
+	}
+	if job.Phase != state.PhaseAborted {
+		t.Errorf("expected Phase=ABORTED, got %s", job.Phase)
+	}
+
+	var columnExists bool
+	colQuery := `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'total')`
+	if err := pool.QueryRow(ctx, colQuery, tableName).Scan(&columnExists); err != nil {
+		t.Fatalf("column check failed: %v", err)
+	}
+	if columnExists {
+		t.Error("expected the column to have been dropped by rollback")
+	}
+
+	// The trigger firing on a subsequent INSERT (after rollback claims
+	// to have removed it) would be a real bug — confirm the table
+	// genuinely behaves as if the migration never happened.
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (price, quantity) VALUES (1, 1)`, tableName)); err != nil {
+		t.Errorf("expected a plain INSERT to succeed after rollback (no leftover trigger referencing a dropped column), got: %v", err)
+	}
+}

@@ -1,0 +1,136 @@
+# pgArchiMigrator's Archi Product Manifest — see AC-PF-003 Section 6 for
+# the full schema this follows. This file is metadata/discovery only
+# (AC-INT-002: "the Product Manifest is a metadata and discovery
+# contract; it is not an executable plugin") — it contains no secrets, no executable
+# content, matching Section 6.4's forbidden-content list exactly.
+#
+# capabilities below map to this product's own operations at the
+# granularity AC-PF-003's own pgArchiNode example uses: one capability
+# per broad lifecycle action (assess/migrate/rollback), not one per
+# internal DDL operation type. The 12 operation types this product
+# supports (ADD_COLUMN, DROP_COLUMN, ALTER_COLUMN_TYPE, ADD_INDEX,
+# DROP_INDEX, SET_NOT_NULL, ADD_CONSTRAINT, RENAME_COLUMN, RENAME_TABLE,
+# ADD_FOREIGN_KEY, ADD_GENERATED_COLUMN, PARTITION_TABLE — see
+# internal/strategy.Operation) are an implementation detail of
+# migration.postgresql.schema.migrate, not each their own capability;
+# an ecosystem consumer asks "can this product migrate a PostgreSQL
+# schema," not "does it support RENAME_TABLE specifically."
+#
+# migration.postgresql.database.upgrade (internal/upgrade — see
+# docs/ecosystem/ARCHITECTURE.md's own "PostgreSQL major-version
+# upgrade" section) is stability: beta, not stable — it has a working
+# CLI + cookie-authenticated dashboard API
+# (POST/GET /api/upgrades[/{id}]) and real integration tests, but no
+# OAuth2/202-pattern ecosystem endpoint yet (unlike
+# migration.postgresql.schema.migrate, which POST /api/v1/migrations
+# already implements) and no dashboard UI. Its requiredScopes entry
+# (pgarchimigrator.upgrade — deliberately SEPARATE from
+# pgarchimigrator.migrate, so a service client can be granted one
+# without the other) names the scope a future ecosystem endpoint would
+# require; nothing enforces it today since no such endpoint exists yet.
+#
+# Event types listed under contracts.events are the full set this
+# product CAN emit — which of them a given instance actually publishes
+# depends on its entitlement tier (see internal/ecosystem/ids.go's own
+# doc comment: migration.phase_changed.v1/upgrade.phase_changed.v1 are
+# Enterprise-only). The manifest doesn't encode that distinction; a
+# consumer that receives fewer event types than listed here is seeing a
+# Community-tier instance, not a broken one.
+schemaVersion: archi.io/product-manifest/v1
+kind: ArchiProduct
+metadata:
+  productId: pgarchimigrator
+  displayName: pgArchiMigrator
+  productVersion: 2.0.0
+  manifestVersion: 1.0.0
+  vendor: pgArchiHub
+  description: Zero-downtime PostgreSQL schema migration platform
+spec:
+  lifecycleDomains:
+    - migration
+  capabilities:
+    - id: migration.postgresql.schema.assess
+      version: 1.0.0
+      resourceTypes:
+        - migration.postgresql.job
+      operations:
+        - read
+      stability: stable
+      edition: [community, enterprise, cloud]
+    - id: migration.postgresql.schema.migrate
+      version: 1.0.0
+      resourceTypes:
+        - migration.postgresql.job
+      operations:
+        - create
+        - execute
+      stability: stable
+      requiredScopes:
+        - pgarchimigrator.migrate
+      edition: [community, enterprise, cloud]
+    - id: migration.postgresql.schema.rollback
+      version: 1.0.0
+      resourceTypes:
+        - migration.postgresql.job
+      operations:
+        - execute
+      stability: stable
+      requiredScopes:
+        - pgarchimigrator.migrate
+      edition: [community, enterprise, cloud]
+    - id: migration.postgresql.database.upgrade
+      version: 1.0.0
+      resourceTypes:
+        - migration.postgresql.upgrade-job
+      operations:
+        - create
+        - execute
+        - read
+      stability: beta
+      requiredScopes:
+        - pgarchimigrator.upgrade
+      edition: [community, enterprise, cloud]
+  contracts:
+    api:
+      basePath: /api/v1
+    events:
+      envelope: archi.io/event-envelope/v1
+      types:
+        - pgarchimigrator.migration.requested.v1
+        - pgarchimigrator.migration.started.v1
+        - pgarchimigrator.migration.completed.v1
+        - pgarchimigrator.migration.failed.v1
+        - pgarchimigrator.migration.rolledback.v1
+        - pgarchimigrator.migration.phase_changed.v1 # Enterprise/Cloud only — see the note above
+        - pgarchimigrator.upgrade.requested.v1
+        - pgarchimigrator.upgrade.completed.v1
+        - pgarchimigrator.upgrade.failed.v1
+        - pgarchimigrator.upgrade.phase_changed.v1 # Enterprise/Cloud only — see the note above
+    realtime:
+      transports:
+        - sse
+  resourceTypes:
+    - type: migration.postgresql.job
+      apiVersion: pgarchimigrator.io/v1
+    - type: migration.postgresql.upgrade-job
+      apiVersion: pgarchimigrator.io/v1
+  actions:
+    discovery: /api/v1/actions
+  console:
+    navigation:
+      - label: Migrations
+        route: /integrations/pgarchimigrator/migrations
+    slots:
+      - slot: resource.database-platform.migrations
+        route: /integrations/pgarchimigrator/migrations/{resourceId}
+        label: Migration Details
+  compatibility:
+    console:
+      minVersion: 0.1.0
+    eventEnvelope:
+      versions: [1]
+  security:
+    authMethods:
+      - oauth2-client-credentials
+    requiredScopes:
+      - pgarchimigrator.read

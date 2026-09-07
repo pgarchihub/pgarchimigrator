@@ -6,11 +6,13 @@
 package progress
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/pgarchihub/pgarchimigrator/internal/state"
+	"github.com/pgarchihub/pgarchimigrator/internal/strategy"
 )
 
 // StageStatus represents where a single pipeline stage stands relative to
@@ -200,7 +202,7 @@ func pipelineFor(strategyName, operation string) []state.Phase {
 		switch operation {
 		case "DROP_COLUMN":
 			return []state.Phase{state.PhasePreparation, state.PhaseRollbackWindow, state.PhaseCompleted}
-		case "SET_NOT_NULL", "ADD_CONSTRAINT":
+		case "SET_NOT_NULL", "ADD_CONSTRAINT", "ADD_FOREIGN_KEY":
 			return []state.Phase{state.PhasePreparation, state.PhaseValidating, state.PhaseCompleted}
 		case "ADD_INDEX":
 			// CREATE INDEX CONCURRENTLY has a known PostgreSQL failure
@@ -214,15 +216,18 @@ func pipelineFor(strategyName, operation string) []state.Phase {
 			// the Migration Detail page's Health Card, see
 			// computeHealthSummary), not just internally enforced.
 			return []state.Phase{state.PhasePreparation, state.PhaseValidating, state.PhaseCompleted}
-		default: // ADD_COLUMN, DROP_INDEX
+		default: // ADD_COLUMN, DROP_INDEX, RENAME_TABLE, ADD_GENERATED_COLUMN (small-table/DIRECT_DDL path)
 			return []state.Phase{state.PhasePreparation, state.PhaseCompleted}
 		}
 	case "EXPAND_BACKFILL":
-		// Same 4-stage pipeline for both users of this strategy: ADD_COLUMN's
-		// volatile-default backfill and RENAME_COLUMN's new-column backfill
-		// (see internal/ddlflow.executeExpandBackfill / executeRenameColumn).
-		// PhaseSyncing means "backfilling the new column from the old one"
-		// for RENAME_COLUMN specifically, but the stage SHAPE is identical.
+		// Same 4-stage pipeline for every user of this strategy:
+		// ADD_COLUMN's volatile-default backfill, RENAME_COLUMN's
+		// new-column backfill, and ADD_GENERATED_COLUMN's large-table
+		// trigger+backfill path (see internal/ddlflow's
+		// executeExpandBackfill / executeRenameColumn /
+		// executeAddGeneratedColumnViaBackfill). PhaseSyncing's exact
+		// meaning differs per operation, but the stage SHAPE is
+		// identical.
 		return []state.Phase{state.PhasePreparation, state.PhaseSyncing, state.PhaseValidating, state.PhaseCompleted}
 	case "SHADOW_TABLE":
 		return []state.Phase{
@@ -486,6 +491,64 @@ func describeOperation(job *state.Job) (summary string, statements []string) {
 		}
 		return summary, statements
 
+	case "ADD_FOREIGN_KEY":
+		summary = fmt.Sprintf("Added foreign key %q on %s.%s: %s references %s.%s",
+			job.ConstraintName, job.SchemaName, job.TableName, job.ColumnName, job.ReferencedTable, job.ReferencedColumn)
+		if job.OnDelete != "" {
+			summary += fmt.Sprintf(" (ON DELETE %s)", job.OnDelete)
+		}
+		qFKConstraint := quoteIdent(job.ConstraintName)
+		fkDDL := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s)",
+			qualified, qFKConstraint, quoteIdent(job.ColumnName),
+			quoteIdent(job.SchemaName), quoteIdent(job.ReferencedTable), quoteIdent(job.ReferencedColumn))
+		if job.OnDelete != "" {
+			fkDDL += " ON DELETE " + job.OnDelete
+		}
+		fkDDL += " NOT VALID"
+		statements = []string{
+			fkDDL,
+			fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s", qualified, qFKConstraint),
+		}
+		return summary, statements
+
+	case "ADD_GENERATED_COLUMN":
+		qCol := quoteIdent(job.ColumnName)
+		if job.Strategy == "EXPAND_BACKFILL" {
+			summary = fmt.Sprintf("Added column %q on %s.%s, computed as %s (kept in sync by a trigger, not a native generated column — the table was too large for PostgreSQL's own GENERATED to add without a full rewrite)",
+				job.ColumnName, job.SchemaName, job.TableName, job.GeneratedExpression)
+			statements = []string{
+				fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s", qualified, qCol, job.ColumnType),
+				"-- a trigger recomputes this column on every INSERT/UPDATE",
+				fmt.Sprintf("UPDATE %s SET %s = %s WHERE %s IS NULL -- backfill, batched", qualified, qCol, job.GeneratedExpression, qCol),
+			}
+			return summary, statements
+		}
+		summary = fmt.Sprintf("Added generated column %q on %s.%s: %s", job.ColumnName, job.SchemaName, job.TableName, job.GeneratedExpression)
+		statements = []string{
+			fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s GENERATED ALWAYS AS (%s) STORED", qualified, qCol, job.ColumnType, job.GeneratedExpression),
+		}
+		return summary, statements
+
+	case "PARTITION_TABLE":
+		var bounds []strategy.PartitionBound
+		_ = json.Unmarshal([]byte(job.PartitionBoundsJSON), &bounds) // best-effort — an empty/invalid JSON just yields 0 partitions in the summary, not an error here
+		partitionWord := "partitions"
+		if len(bounds) == 1 {
+			partitionWord = "partition"
+		}
+		defaultNote := ""
+		if job.PartitionIncludeDefault {
+			defaultNote = " plus a DEFAULT partition"
+		}
+		summary = fmt.Sprintf("Partitioned %s.%s by %s on %q into %d %s%s (a new table built alongside the original, synced via logical replication, then swapped in atomically)",
+			job.SchemaName, job.TableName, job.PartitionStrategy, job.PartitionColumn, len(bounds), partitionWord, defaultNote)
+		statements = []string{
+			fmt.Sprintf("CREATE TABLE <shadow> (<source columns>) PARTITION BY %s (%s)", job.PartitionStrategy, quoteIdent(job.PartitionColumn)),
+			fmt.Sprintf("-- %d partition(s) attached, one CREATE TABLE ... PARTITION OF each%s", len(bounds), defaultNote),
+			"-- kept in sync via logical replication, then swapped in atomically",
+		}
+		return summary, statements
+
 	case "RENAME_COLUMN":
 		summary = fmt.Sprintf("Renamed column %q to %q on %s.%s (dual-write: both names work until the old one is explicitly dropped)",
 			job.ColumnName, job.NewColumnName, job.SchemaName, job.TableName)
@@ -494,6 +557,17 @@ func describeOperation(job *state.Job) (summary string, statements []string) {
 			"-- a trigger keeps both columns synchronized on every INSERT/UPDATE",
 			fmt.Sprintf("UPDATE %s SET %s = %s WHERE %s IS NULL -- backfill, batched",
 				qualified, quoteIdent(job.NewColumnName), quoteIdent(job.ColumnName), quoteIdent(job.NewColumnName)),
+		}
+		return summary, statements
+
+	case "RENAME_TABLE":
+		summary = fmt.Sprintf("Renamed table %s.%s to %s.%s (a compatibility view under the old name keeps it readable and writable until explicitly dropped)",
+			job.SchemaName, job.TableName, job.SchemaName, job.NewTableName)
+		oldQualified := qualified
+		newQualified := quoteIdent(job.SchemaName) + "." + quoteIdent(job.NewTableName)
+		statements = []string{
+			fmt.Sprintf("ALTER TABLE %s RENAME TO %s", oldQualified, quoteIdent(job.NewTableName)),
+			fmt.Sprintf("CREATE VIEW %s AS SELECT * FROM %s", oldQualified, newQualified),
 		}
 		return summary, statements
 

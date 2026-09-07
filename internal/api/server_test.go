@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -14,9 +15,12 @@ import (
 	"github.com/pgarchihub/pgarchimigrator/internal/api"
 	"github.com/pgarchihub/pgarchimigrator/internal/auth"
 	"github.com/pgarchihub/pgarchimigrator/internal/db"
+	"github.com/pgarchihub/pgarchimigrator/internal/idempotency"
 	"github.com/pgarchihub/pgarchimigrator/internal/orchestrator"
+	"github.com/pgarchihub/pgarchimigrator/internal/serviceauth"
 	"github.com/pgarchihub/pgarchimigrator/internal/state"
 	"github.com/pgarchihub/pgarchimigrator/internal/strategy"
+	"github.com/pgarchihub/pgarchimigrator/internal/upgrade"
 )
 
 // fakeStore is a minimal in-memory state.Store, duplicated here (rather
@@ -188,7 +192,7 @@ func newTestServer(t *testing.T, store *fakeStore, flow *fakeFlow) (*api.Server,
 		t.Fatalf("could not create test organization: %v", err)
 	}
 
-	srv := api.NewServer(orch, store, nil, authService, false, nil, db.ConnectionInfo{}) // nil Reaper: sweep endpoint tested separately; nil pool: preview endpoint needs a real Postgres, tested in internal/preview instead
+	srv := api.NewServer(orch, store, nil, authService, nil, nil, nil, nil, false, nil, db.ConnectionInfo{}) // nil Reaper: sweep endpoint tested separately; nil pool: preview endpoint needs a real Postgres, tested in internal/preview instead
 
 	users := &testUsers{
 		org:      org,
@@ -268,7 +272,7 @@ func newSetupTestServer(t *testing.T) *api.Server {
 	}
 	t.Cleanup(func() { authStore.Close() })
 	authService := auth.NewService(authStore)
-	return api.NewServer(orch, store, nil, authService, false, nil, db.ConnectionInfo{})
+	return api.NewServer(orch, store, nil, authService, nil, nil, nil, nil, false, nil, db.ConnectionInfo{})
 }
 
 func TestHandleSetupRequired_TrueOnFreshDeployment(t *testing.T) {
@@ -391,29 +395,23 @@ func TestHandleHealth(t *testing.T) {
 	}
 }
 
-// TestHandleDashboard_ServesHTML verifies the legacy vanilla-JS dashboard
-// is still reachable at /legacy — kept as a short-term fallback during
-// the cutover to the React SPA (see the "/" redirect test below), not
-// deleted outright.
-func TestHandleDashboard_ServesHTML(t *testing.T) {
+// TestHandleLegacy_Returns404 is the direct regression test for the
+// vanilla-JS dashboard's removal — it never supported anything past
+// ADD_COLUMN/ALTER_COLUMN_TYPE (not even v1.0's later operations, let
+// alone v2.0's), so it had already stopped being a genuine fallback by
+// the time this route was removed. Confirms /legacy is genuinely gone,
+// not silently still serving stale HTML.
+func TestHandleLegacy_Returns404(t *testing.T) {
 	srv, _ := newTestServer(t, newFakeStore(), &fakeFlow{})
-	rec := doRequest(t, srv, http.MethodGet, "/legacy", nil, nil) // public: no cookie needed
+	rec := doRequest(t, srv, http.MethodGet, "/legacy", nil, nil)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	ct := rec.Header().Get("Content-Type")
-	if !strings.Contains(ct, "text/html") {
-		t.Errorf("expected Content-Type text/html, got %q", ct)
-	}
-	if !strings.Contains(rec.Body.String(), "pgArchiMigrator") {
-		t.Error("expected the dashboard HTML to mention 'pgArchiMigrator'")
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404 now that /legacy has been removed, got %d", rec.Code)
 	}
 }
 
 // TestHandleRoot_RedirectsToWebapp is a regression test for the cutover:
-// "/" must now send the user to the React SPA at /app, not serve the
-// legacy dashboard HTML directly.
+// "/" must send the user to the React SPA at /app.
 func TestHandleRoot_RedirectsToWebapp(t *testing.T) {
 	srv, _ := newTestServer(t, newFakeStore(), &fakeFlow{})
 	rec := doRequest(t, srv, http.MethodGet, "/", nil, nil)
@@ -423,6 +421,41 @@ func TestHandleRoot_RedirectsToWebapp(t *testing.T) {
 	}
 	if loc := rec.Header().Get("Location"); loc != "/app/" {
 		t.Errorf("expected redirect Location=/app/, got %q", loc)
+	}
+}
+
+// TestHandleManifest_PubliclyAccessible_NoCookieNeeded is the direct
+// regression test for handleManifest's own reasoning: an ecosystem
+// consumer discovering this product for the first time has no trust
+// relationship (and therefore no session cookie) yet — see AC-PF-003
+// Section 8.2's registration flow, which this endpoint exists to
+// support.
+func TestHandleManifest_PubliclyAccessible_NoCookieNeeded(t *testing.T) {
+	srv, _ := newTestServer(t, newFakeStore(), &fakeFlow{})
+	rec := doRequest(t, srv, http.MethodGet, "/api/v1/manifest", nil, nil) // no cookie
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	ct := rec.Header().Get("Content-Type")
+	if !strings.Contains(ct, "yaml") {
+		t.Errorf("expected a YAML content type, got %q", ct)
+	}
+}
+
+// TestHandleManifest_ContentMatchesProductID confirms the served bytes
+// are genuinely this product's own manifest — not an empty embed, not
+// a stale/mismatched file.
+func TestHandleManifest_ContentMatchesProductID(t *testing.T) {
+	srv, _ := newTestServer(t, newFakeStore(), &fakeFlow{})
+	rec := doRequest(t, srv, http.MethodGet, "/api/v1/manifest", nil, nil)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "productId: pgarchimigrator") {
+		t.Errorf("expected the manifest to identify productId: pgarchimigrator, got: %s", body)
+	}
+	if !strings.Contains(body, "migration.postgresql.schema.migrate") {
+		t.Errorf("expected the manifest to list its core capability, got: %s", body)
 	}
 }
 
@@ -460,7 +493,7 @@ func TestHandleGetConnectionInfo_ReturnsFieldsButNeverAPassword(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseConnectionInfo failed: %v", err)
 	}
-	srv := api.NewServer(orch, store, nil, authService, false, nil, connInfo)
+	srv := api.NewServer(orch, store, nil, authService, nil, nil, nil, nil, false, nil, connInfo)
 
 	rec := doRequest(t, srv, http.MethodGet, "/api/connection", nil, viewerCookie)
 	if rec.Code != http.StatusOK {
@@ -1004,5 +1037,938 @@ func TestHandleUpdateUserRole_CannotChangeOwnRole(t *testing.T) {
 	rec := doRequest(t, srv, http.MethodPatch, "/api/users/"+selfID+"/role", map[string]string{"role": "viewer"}, users.admin)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 (cannot change own role), got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// --- OAuth2 token endpoint (POST /oauth/token) tests ---
+
+// doOAuthRequest sends a form-urlencoded request — deliberately NOT
+// doRequest above, which always sets Content-Type: application/json;
+// RFC 6749 Section 4.4.2 mandates application/x-www-form-urlencoded for
+// the client_credentials grant, and handleOAuthToken parses the request
+// with r.ParseForm accordingly.
+func doOAuthRequest(t *testing.T, srv *api.Server, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	return rec
+}
+
+// newTestServerWithServiceAuth mirrors newTestServer, but ALSO wires up
+// a real serviceauth.Service (newTestServer's own ServiceAuth stays nil
+// — see its own NewServer call — since most tests have no need for it).
+// Returns the registered test client's raw credentials alongside the
+// server, for tests to exchange at /oauth/token.
+func newTestServerWithServiceAuth(t *testing.T, store *fakeStore, flow *fakeFlow, scopes []string) (srv *api.Server, clientID, clientSecret string) {
+	t.Helper()
+
+	orch := orchestrator.New(store,
+		func(strategy.Strategy) (orchestrator.Flow, error) { return flow, nil },
+		func(ctx context.Context, schema, table string) (strategy.TableStats, error) {
+			return strategy.TableStats{EstimatedRowCount: 100, HasPrimaryKey: true}, nil
+		},
+	)
+
+	authStore, err := auth.NewSQLiteStore(filepath.Join(t.TempDir(), "auth-test.db"))
+	if err != nil {
+		t.Fatalf("could not create auth store: %v", err)
+	}
+	t.Cleanup(func() { authStore.Close() })
+	authService := auth.NewService(authStore)
+
+	svcAuthStore, err := serviceauth.NewSQLiteStore(filepath.Join(t.TempDir(), "serviceauth-test.db"))
+	if err != nil {
+		t.Fatalf("could not create service-auth store: %v", err)
+	}
+	t.Cleanup(func() { svcAuthStore.Close() })
+	svcAuthService := serviceauth.NewService(svcAuthStore)
+
+	rawSecret, secretHash, err := serviceauth.GenerateClientSecret()
+	if err != nil {
+		t.Fatalf("could not generate client secret: %v", err)
+	}
+	client := &serviceauth.Client{Name: "test-client", ClientID: "test-client-id", ClientSecretHash: secretHash, Scopes: scopes}
+	if err := svcAuthStore.CreateClient(context.Background(), client); err != nil {
+		t.Fatalf("could not create test client: %v", err)
+	}
+
+	srv = api.NewServer(orch, store, nil, authService, svcAuthService, nil, nil, nil, false, nil, db.ConnectionInfo{})
+	return srv, client.ClientID, rawSecret
+}
+
+// newTestServerWithServiceAuthAndUpgrade combines
+// newTestServerWithServiceAuth's own ServiceAuth setup with
+// newTestServerWithUpgrade's own real upgrade.SQLiteStore — needed for
+// handleEcosystemStartUpgrade's own tests, which (unlike
+// handleEcosystemStartMigration's) require BOTH wired up at once.
+func newTestServerWithServiceAuthAndUpgrade(t *testing.T, scopes []string) (srv *api.Server, clientID, clientSecret string) {
+	t.Helper()
+
+	orch := orchestrator.New(newFakeStore(),
+		func(strategy.Strategy) (orchestrator.Flow, error) { return &fakeFlow{}, nil },
+		func(ctx context.Context, schema, table string) (strategy.TableStats, error) {
+			return strategy.TableStats{EstimatedRowCount: 100, HasPrimaryKey: true}, nil
+		},
+	)
+
+	authStore, err := auth.NewSQLiteStore(filepath.Join(t.TempDir(), "auth-test.db"))
+	if err != nil {
+		t.Fatalf("could not create auth store: %v", err)
+	}
+	t.Cleanup(func() { authStore.Close() })
+	authService := auth.NewService(authStore)
+
+	svcAuthStore, err := serviceauth.NewSQLiteStore(filepath.Join(t.TempDir(), "serviceauth-test.db"))
+	if err != nil {
+		t.Fatalf("could not create service-auth store: %v", err)
+	}
+	t.Cleanup(func() { svcAuthStore.Close() })
+	svcAuthService := serviceauth.NewService(svcAuthStore)
+
+	rawSecret, secretHash, err := serviceauth.GenerateClientSecret()
+	if err != nil {
+		t.Fatalf("could not generate client secret: %v", err)
+	}
+	client := &serviceauth.Client{Name: "test-client", ClientID: "test-client-id", ClientSecretHash: secretHash, Scopes: scopes}
+	if err := svcAuthStore.CreateClient(context.Background(), client); err != nil {
+		t.Fatalf("could not create test client: %v", err)
+	}
+
+	upgradeStore, err := upgrade.NewSQLiteStore(filepath.Join(t.TempDir(), "upgrade-test.db"))
+	if err != nil {
+		t.Fatalf("could not create upgrade store: %v", err)
+	}
+	t.Cleanup(func() { upgradeStore.Close() })
+
+	idempotencyStore, err := idempotency.NewSQLiteStore(filepath.Join(t.TempDir(), "idempotency-test.db"))
+	if err != nil {
+		t.Fatalf("could not create idempotency store: %v", err)
+	}
+	t.Cleanup(func() { idempotencyStore.Close() })
+
+	srv = api.NewServer(orch, newFakeStore(), nil, authService, svcAuthService, upgradeStore, upgrade.StaticConnectionProvider{}, idempotencyStore, false, nil, db.ConnectionInfo{})
+	return srv, client.ClientID, rawSecret
+}
+
+func TestHandleOAuthToken_ServiceAuthNotConfigured_Returns503(t *testing.T) {
+	// Uses plain newTestServer (nil ServiceAuth) — the direct regression
+	// test for handleOAuthToken's own "optional dependency wasn't wired
+	// up" precedent, matching handleSweep's identical nil-Reaper
+	// behavior.
+	srv, _ := newTestServer(t, newFakeStore(), &fakeFlow{})
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {"x"}, "client_secret": {"y"}}
+	rec := doOAuthRequest(t, srv, form)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", rec.Code)
+	}
+}
+
+func TestHandleOAuthToken_ValidCredentials_ReturnsAccessToken(t *testing.T) {
+	srv, clientID, clientSecret := newTestServerWithServiceAuth(t, newFakeStore(), &fakeFlow{}, []string{"pgarchimigrator.read"})
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret}}
+	rec := doOAuthRequest(t, srv, form)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid JSON response: %v", err)
+	}
+	if body["access_token"] == "" || body["access_token"] == nil {
+		t.Error("expected a non-empty access_token")
+	}
+	if body["token_type"] != "Bearer" {
+		t.Errorf("expected token_type=Bearer, got %v", body["token_type"])
+	}
+	if body["scope"] != "pgarchimigrator.read" {
+		t.Errorf("expected scope='pgarchimigrator.read', got %v", body["scope"])
+	}
+}
+
+// TestHandleOAuthToken_WrongSecret_ReturnsInvalidClient is the direct
+// regression test for handleOAuthToken correctly mapping
+// serviceauth.ErrInvalidClient to RFC 6749's own "invalid_client" error
+// code and 401 status — not a generic 500.
+func TestHandleOAuthToken_WrongSecret_ReturnsInvalidClient(t *testing.T) {
+	srv, clientID, _ := newTestServerWithServiceAuth(t, newFakeStore(), &fakeFlow{}, []string{"pgarchimigrator.read"})
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {"wrong-secret"}}
+	rec := doOAuthRequest(t, srv, form)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+	var body map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if body["error"] != "invalid_client" {
+		t.Errorf("expected error=invalid_client, got %v", body["error"])
+	}
+}
+
+func TestHandleOAuthToken_ScopeExceedsAllowed_ReturnsInvalidScope(t *testing.T) {
+	srv, clientID, clientSecret := newTestServerWithServiceAuth(t, newFakeStore(), &fakeFlow{}, []string{"pgarchimigrator.read"})
+	form := url.Values{
+		"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret},
+		"scope": {"pgarchimigrator.read pgarchimigrator.migrate"},
+	}
+	rec := doOAuthRequest(t, srv, form)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+	var body map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if body["error"] != "invalid_scope" {
+		t.Errorf("expected error=invalid_scope, got %v", body["error"])
+	}
+}
+
+func TestHandleOAuthToken_UnsupportedGrantType_Rejected(t *testing.T) {
+	srv, clientID, clientSecret := newTestServerWithServiceAuth(t, newFakeStore(), &fakeFlow{}, []string{"pgarchimigrator.read"})
+	form := url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "client_secret": {clientSecret}}
+	rec := doOAuthRequest(t, srv, form)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+	var body map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if body["error"] != "unsupported_grant_type" {
+		t.Errorf("expected error=unsupported_grant_type, got %v", body["error"])
+	}
+}
+
+// TestHandleOAuthToken_IssuedToken_ActuallyWorksOnAProtectedRoute is an
+// end-to-end regression test spanning handleOAuthToken AND
+// serviceauth.RequireBearer together — confirms a token obtained from
+// THIS endpoint is genuinely usable, not just well-formed. Uses the
+// manifest endpoint (already public) only as a convenient always-200
+// target; the actual behavior under test is independent of which route
+// is called.
+func TestHandleOAuthToken_IssuedToken_ActuallyWorksOnAProtectedRoute(t *testing.T) {
+	srv, clientID, clientSecret := newTestServerWithServiceAuth(t, newFakeStore(), &fakeFlow{}, []string{"pgarchimigrator.read"})
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret}}
+	tokenRec := doOAuthRequest(t, srv, form)
+
+	var body map[string]any
+	_ = json.Unmarshal(tokenRec.Body.Bytes(), &body)
+	rawToken, _ := body["access_token"].(string)
+	if rawToken == "" {
+		t.Fatal("expected a usable access token from the token endpoint")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/manifest", nil)
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected the issued token to work, got %d", rec.Code)
+	}
+}
+
+// --- Ecosystem migration endpoint (POST /api/v1/migrations) tests ---
+
+func TestHandleEcosystemStartMigration_NoScope_Returns403(t *testing.T) {
+	srv, clientID, clientSecret := newTestServerWithServiceAuth(t, newFakeStore(), &fakeFlow{}, []string{"pgarchimigrator.read"}) // read only, not migrate
+	tokenForm := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret}}
+	tokenRec := doOAuthRequest(t, srv, tokenForm)
+	var tokenBody map[string]any
+	_ = json.Unmarshal(tokenRec.Body.Bytes(), &tokenBody)
+	rawToken, _ := tokenBody["access_token"].(string)
+
+	body, _ := json.Marshal(map[string]string{"table": "orders", "operation": "ADD_COLUMN", "column": "total", "type": "numeric"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/migrations", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for a token without the migrate scope, got %d", rec.Code)
+	}
+}
+
+// TestHandleEcosystemStartMigration_ValidRequest_Returns202WithLocation
+// is the direct regression test for AC-PF-003 Section 13.2's own
+// "202 Accepted + operation reference" pattern — the entire reason this
+// endpoint is shaped differently from handleStartMigration.
+func TestHandleEcosystemStartMigration_ValidRequest_Returns202WithLocation(t *testing.T) {
+	store := newFakeStore()
+	srv, clientID, clientSecret := newTestServerWithServiceAuth(t, store, &fakeFlow{}, []string{"pgarchimigrator.migrate"})
+	tokenForm := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret}}
+	tokenRec := doOAuthRequest(t, srv, tokenForm)
+	var tokenBody map[string]any
+	_ = json.Unmarshal(tokenRec.Body.Bytes(), &tokenBody)
+	rawToken, _ := tokenBody["access_token"].(string)
+
+	reqBody, _ := json.Marshal(map[string]string{"table": "orders", "operation": "ADD_COLUMN", "column": "total", "type": "numeric"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/migrations", strings.NewReader(string(reqBody)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc == "" {
+		t.Error("expected a Location header pointing at the new job")
+	}
+	var body operationAcceptedResponseForTest
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid JSON response: %v", err)
+	}
+	if body.Status != "accepted" {
+		t.Errorf("expected status='accepted', got %q", body.Status)
+	}
+	if body.OperationID == "" {
+		t.Error("expected a non-empty operationId")
+	}
+	if store.count() != 1 {
+		t.Errorf("expected exactly 1 job to have been created, got %d", store.count())
+	}
+}
+
+// operationAcceptedResponseForTest mirrors api's own unexported
+// operationAcceptedResponse — duplicated here (this is an external
+// _test package, api_test, with no access to api's unexported types)
+// purely to decode the response body's known shape.
+type operationAcceptedResponseForTest struct {
+	OperationID string `json:"operationId"`
+	Status      string `json:"status"`
+	StatusURL   string `json:"statusUrl"`
+}
+
+// TestHandleEcosystemStartMigration_PropagatesCorrelationHeaders is the
+// direct regression test for AC-PF-003 Section 12.3's own header
+// contract actually reaching the created job — not just being read and
+// discarded. Confirms X-Archi-Command-Id specifically lands on
+// CausationID (not a same-named CausationID header, which doesn't
+// exist in the spec — see docs/ecosystem/ARCHITECTURE.md's own note on
+// this).
+func TestHandleEcosystemStartMigration_PropagatesCorrelationHeaders(t *testing.T) {
+	store := newFakeStore()
+	srv, clientID, clientSecret := newTestServerWithServiceAuth(t, store, &fakeFlow{}, []string{"pgarchimigrator.migrate"})
+	tokenForm := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret}}
+	tokenRec := doOAuthRequest(t, srv, tokenForm)
+	var tokenBody map[string]any
+	_ = json.Unmarshal(tokenRec.Body.Bytes(), &tokenBody)
+	rawToken, _ := tokenBody["access_token"].(string)
+
+	reqBody, _ := json.Marshal(map[string]string{"table": "orders", "operation": "ADD_COLUMN", "column": "total", "type": "numeric"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/migrations", strings.NewReader(string(reqBody)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+	req.Header.Set("X-Correlation-ID", "cor-abc123")
+	req.Header.Set("X-Archi-Lifecycle-Id", "lc-xyz789")
+	req.Header.Set("X-Archi-Command-Id", "cmd-def456")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var body operationAcceptedResponseForTest
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+
+	job, err := store.Get(context.Background(), body.OperationID)
+	if err != nil {
+		t.Fatalf("could not read back the created job: %v", err)
+	}
+	if job.CorrelationID != "cor-abc123" {
+		t.Errorf("expected CorrelationID='cor-abc123', got %q", job.CorrelationID)
+	}
+	if job.LifecycleID != "lc-xyz789" {
+		t.Errorf("expected LifecycleID='lc-xyz789', got %q", job.LifecycleID)
+	}
+	if job.CausationID != "cmd-def456" {
+		t.Errorf("expected CausationID='cmd-def456' (from X-Archi-Command-Id), got %q", job.CausationID)
+	}
+}
+
+func TestHandleEcosystemStartMigration_ServiceAuthNotConfigured_Returns503(t *testing.T) {
+	srv, _ := newTestServer(t, newFakeStore(), &fakeFlow{}) // nil ServiceAuth
+	reqBody, _ := json.Marshal(map[string]string{"table": "orders", "operation": "ADD_COLUMN", "column": "total", "type": "numeric"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/migrations", strings.NewReader(string(reqBody)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer irrelevant")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", rec.Code)
+	}
+}
+
+// --- Upgrade endpoint (/api/upgrades) tests ---
+
+func TestHandleStartUpgrade_NotConfigured_Returns503(t *testing.T) {
+	// newTestServer's own UpgradeStore stays nil — see its own doc
+	// comment for why most tests have no need for it, matching
+	// ServiceAuth's identical default.
+	srv, users := newTestServer(t, newFakeStore(), &fakeFlow{})
+	body := map[string]any{"sourceDsn": "postgresql://x", "targetDsn": "postgresql://y"}
+	rec := doRequest(t, srv, http.MethodPost, "/api/upgrades", body, users.admin)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", rec.Code)
+	}
+}
+
+func TestHandleStartUpgrade_RequiresAdminRole(t *testing.T) {
+	srv, users := newTestServer(t, newFakeStore(), &fakeFlow{})
+	body := map[string]any{"sourceDsn": "postgresql://x", "targetDsn": "postgresql://y"}
+	// operator is below the RoleAdmin minimum this route requires — see
+	// server.go's own routes() comment on why upgrades need a stricter
+	// role than migrations do.
+	rec := doRequest(t, srv, http.MethodPost, "/api/upgrades", body, users.operator)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for an operator (below RoleAdmin), got %d", rec.Code)
+	}
+}
+
+// newTestServerWithUpgrade mirrors newTestServerWithServiceAuth's own
+// pattern — a real upgrade.SQLiteStore (this package has no non-SQLite
+// Store implementation, matching internal/auth/internal/serviceauth's
+// own precedent), wired into a real *api.Server.
+func newTestServerWithUpgrade(t *testing.T) (*api.Server, *testUsers) {
+	t.Helper()
+
+	orch := orchestrator.New(newFakeStore(),
+		func(strategy.Strategy) (orchestrator.Flow, error) { return &fakeFlow{}, nil },
+		func(ctx context.Context, schema, table string) (strategy.TableStats, error) {
+			return strategy.TableStats{EstimatedRowCount: 100, HasPrimaryKey: true}, nil
+		},
+	)
+
+	authStore, err := auth.NewSQLiteStore(filepath.Join(t.TempDir(), "auth-test.db"))
+	if err != nil {
+		t.Fatalf("could not create auth store: %v", err)
+	}
+	t.Cleanup(func() { authStore.Close() })
+	authService := auth.NewService(authStore)
+
+	org := &auth.Organization{Name: "Test Org"}
+	if err := authStore.CreateOrganization(context.Background(), org); err != nil {
+		t.Fatalf("could not create test organization: %v", err)
+	}
+
+	upgradeStore, err := upgrade.NewSQLiteStore(filepath.Join(t.TempDir(), "upgrade-test.db"))
+	if err != nil {
+		t.Fatalf("could not create upgrade store: %v", err)
+	}
+	t.Cleanup(func() { upgradeStore.Close() })
+
+	srv := api.NewServer(orch, newFakeStore(), nil, authService, nil, upgradeStore, upgrade.StaticConnectionProvider{}, nil, false, nil, db.ConnectionInfo{})
+	users := &testUsers{
+		org:      org,
+		admin:    mustLogin(t, authService, org.ID, "admin@test.local", auth.RoleAdmin),
+		operator: mustLogin(t, authService, org.ID, "operator@test.local", auth.RoleOperator),
+		viewer:   mustLogin(t, authService, org.ID, "viewer@test.local", auth.RoleViewer),
+	}
+	return srv, users
+}
+
+// TestHandleStartUpgrade_ValidRequest_Returns202WithJobID confirms the
+// handler creates a real, durable job and responds with AC-PF-003
+// Section 13.2's own "202 Accepted + operation reference" shape —
+// matching handleEcosystemStartMigration's identical pattern, applied
+// here to the cookie-authenticated dashboard surface rather than the
+// OAuth2 one. Does NOT wait for (or assert anything about) the
+// background Flow.Run itself succeeding — that needs a real PostgreSQL
+// pair and is covered by internal/upgrade's own
+// flow_integration_test.go; this test is purely about the HTTP
+// contract: did a job get created and durably persisted, and did the
+// response look right.
+func TestHandleStartUpgrade_ValidRequest_Returns202WithJobID(t *testing.T) {
+	srv, users := newTestServerWithUpgrade(t)
+	body := map[string]any{
+		"sourceDsn": "postgresql://nonexistent-host-for-this-test/db",
+		"targetDsn": "postgresql://nonexistent-host-for-this-test/db",
+		"schemas":   []string{"public"},
+	}
+	rec := doRequest(t, srv, http.MethodPost, "/api/upgrades", body, users.admin)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc == "" {
+		t.Error("expected a Location header")
+	}
+	var respBody map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &respBody); err != nil {
+		t.Fatalf("invalid JSON response: %v", err)
+	}
+	if respBody["id"] == "" {
+		t.Error("expected a non-empty job id")
+	}
+	if respBody["status"] != "accepted" {
+		t.Errorf("expected status='accepted', got %q", respBody["status"])
+	}
+}
+
+func TestHandleStartUpgrade_MissingDSNs_Returns400(t *testing.T) {
+	srv, users := newTestServerWithUpgrade(t)
+	rec := doRequest(t, srv, http.MethodPost, "/api/upgrades", map[string]any{}, users.admin)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing sourceDsn/targetDsn, got %d", rec.Code)
+	}
+}
+
+// TestHandleGetUpgrade_ReturnsJobAndTables is the direct regression
+// test for handleGetUpgrade combining a Job with its own per-table
+// progress in one response — the dashboard's own single round trip for
+// a job's detail page.
+func TestHandleGetUpgrade_ReturnsJobAndTables(t *testing.T) {
+	srv, users := newTestServerWithUpgrade(t)
+	startBody := map[string]any{"sourceDsn": "postgresql://x/db", "targetDsn": "postgresql://y/db"}
+	startRec := doRequest(t, srv, http.MethodPost, "/api/upgrades", startBody, users.admin)
+	var startResp map[string]string
+	_ = json.Unmarshal(startRec.Body.Bytes(), &startResp)
+	jobID := startResp["id"]
+
+	rec := doRequest(t, srv, http.MethodGet, "/api/upgrades/"+jobID, nil, users.operator)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("invalid JSON response: %v", err)
+	}
+	if detail["ID"] != jobID {
+		t.Errorf("expected the job's own ID in the response, got %v", detail["ID"])
+	}
+	if _, ok := detail["tables"]; !ok {
+		t.Error("expected a 'tables' field in the response, even if empty")
+	}
+}
+
+func TestHandleGetUpgrade_UnknownID_Returns404(t *testing.T) {
+	srv, users := newTestServerWithUpgrade(t)
+	rec := doRequest(t, srv, http.MethodGet, "/api/upgrades/nonexistent-job-id", nil, users.operator)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rec.Code)
+	}
+}
+
+func TestHandleListUpgrades_ReturnsCreatedJobs(t *testing.T) {
+	srv, users := newTestServerWithUpgrade(t)
+	body := map[string]any{"sourceDsn": "postgresql://x/db", "targetDsn": "postgresql://y/db"}
+	doRequest(t, srv, http.MethodPost, "/api/upgrades", body, users.admin)
+	doRequest(t, srv, http.MethodPost, "/api/upgrades", body, users.admin)
+
+	rec := doRequest(t, srv, http.MethodGet, "/api/upgrades", nil, users.viewer)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var jobs []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &jobs); err != nil {
+		t.Fatalf("invalid JSON response: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Errorf("expected 2 upgrade jobs, got %d", len(jobs))
+	}
+}
+
+// --- Introspection endpoint (POST /api/upgrades/introspect-source) tests ---
+
+func TestHandleIntrospectUpgradeSource_MissingSourceDsn_Returns400(t *testing.T) {
+	srv, users := newTestServer(t, newFakeStore(), &fakeFlow{})
+	rec := doRequest(t, srv, http.MethodPost, "/api/upgrades/introspect-source", map[string]any{}, users.admin)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rec.Code)
+	}
+}
+
+// TestHandleIntrospectUpgradeSource_UnreachableSource_Returns502 is the
+// one real, end-to-end-verifiable behavior of this handler available in
+// this sandbox (no real reachable PostgreSQL instance to introspect
+// successfully against here) — confirms an unreachable/invalid source
+// fails with a clear 502, not a hang or a 500.
+func TestHandleIntrospectUpgradeSource_UnreachableSource_Returns502(t *testing.T) {
+	srv, users := newTestServer(t, newFakeStore(), &fakeFlow{})
+	body := map[string]any{"sourceDsn": "postgresql://user:pass@nonexistent-host-for-this-test:5432/db"}
+	rec := doRequest(t, srv, http.MethodPost, "/api/upgrades/introspect-source", body, users.admin)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("expected 502 for an unreachable source, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleIntrospectUpgradeSource_RequiresAdminRole(t *testing.T) {
+	srv, users := newTestServer(t, newFakeStore(), &fakeFlow{})
+	body := map[string]any{"sourceDsn": "postgresql://x/db"}
+	rec := doRequest(t, srv, http.MethodPost, "/api/upgrades/introspect-source", body, users.operator)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for an operator (below RoleAdmin), got %d", rec.Code)
+	}
+}
+
+// TestHandleStartUpgrade_TablesField_CarriesOverToTheJob is the direct
+// regression test for Priority 3's own table-level scoping actually
+// reaching the created job — not just being accepted and silently
+// dropped.
+func TestHandleStartUpgrade_TablesField_CarriesOverToTheJob(t *testing.T) {
+	srv, users := newTestServerWithUpgrade(t)
+	body := map[string]any{
+		"sourceDsn": "postgresql://x/db",
+		"targetDsn": "postgresql://y/db",
+		"tables": []map[string]string{
+			{"schema": "public", "table": "orders"},
+			{"schema": "reporting", "table": "events"},
+		},
+	}
+	startRec := doRequest(t, srv, http.MethodPost, "/api/upgrades", body, users.admin)
+	if startRec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", startRec.Code, startRec.Body.String())
+	}
+	var startResp map[string]string
+	_ = json.Unmarshal(startRec.Body.Bytes(), &startResp)
+
+	detailRec := doRequest(t, srv, http.MethodGet, "/api/upgrades/"+startResp["id"], nil, users.admin)
+	var detail map[string]any
+	_ = json.Unmarshal(detailRec.Body.Bytes(), &detail)
+
+	tables, ok := detail["Tables"].([]any)
+	if !ok || len(tables) != 2 {
+		t.Fatalf("expected 2 tables to carry over onto the job, got: %v", detail["Tables"])
+	}
+}
+
+// --- Ecosystem upgrade endpoint (POST /api/v1/upgrades) tests ---
+
+func TestHandleEcosystemStartUpgrade_NotConfigured_Returns503(t *testing.T) {
+	// newTestServerWithServiceAuth's own UpgradeStore stays nil.
+	srv, clientID, clientSecret := newTestServerWithServiceAuth(t, newFakeStore(), &fakeFlow{}, []string{"pgarchimigrator.upgrade"})
+	tokenForm := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret}}
+	tokenRec := doOAuthRequest(t, srv, tokenForm)
+	var tokenBody map[string]any
+	_ = json.Unmarshal(tokenRec.Body.Bytes(), &tokenBody)
+	rawToken, _ := tokenBody["access_token"].(string)
+
+	body, _ := json.Marshal(map[string]string{"sourceDsn": "postgresql://x", "targetDsn": "postgresql://y"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/upgrades", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", rec.Code)
+	}
+}
+
+func TestHandleEcosystemStartUpgrade_WrongScope_Returns403(t *testing.T) {
+	srv, clientID, clientSecret := newTestServerWithServiceAuthAndUpgrade(t, []string{"pgarchimigrator.migrate"}) // migrate, not upgrade
+	tokenForm := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret}}
+	tokenRec := doOAuthRequest(t, srv, tokenForm)
+	var tokenBody map[string]any
+	_ = json.Unmarshal(tokenRec.Body.Bytes(), &tokenBody)
+	rawToken, _ := tokenBody["access_token"].(string)
+
+	body, _ := json.Marshal(map[string]string{"sourceDsn": "postgresql://x", "targetDsn": "postgresql://y"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/upgrades", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for a token without the upgrade scope, got %d", rec.Code)
+	}
+}
+
+// TestHandleEcosystemStartUpgrade_ValidRequest_Returns202WithJobID
+// mirrors TestHandleEcosystemStartMigration_ValidRequest_Returns202WithLocation's
+// own pattern, applied to the upgrade endpoint.
+func TestHandleEcosystemStartUpgrade_ValidRequest_Returns202WithJobID(t *testing.T) {
+	srv, clientID, clientSecret := newTestServerWithServiceAuthAndUpgrade(t, []string{"pgarchimigrator.upgrade"})
+	tokenForm := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret}}
+	tokenRec := doOAuthRequest(t, srv, tokenForm)
+	var tokenBody map[string]any
+	_ = json.Unmarshal(tokenRec.Body.Bytes(), &tokenBody)
+	rawToken, _ := tokenBody["access_token"].(string)
+
+	body, _ := json.Marshal(map[string]string{"sourceDsn": "postgresql://nonexistent/db", "targetDsn": "postgresql://nonexistent/db"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/upgrades", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc == "" {
+		t.Error("expected a Location header")
+	}
+	var respBody operationAcceptedResponseForTest
+	if err := json.Unmarshal(rec.Body.Bytes(), &respBody); err != nil {
+		t.Fatalf("invalid JSON response: %v", err)
+	}
+	if respBody.OperationID == "" {
+		t.Error("expected a non-empty operationId")
+	}
+	if respBody.Status != "accepted" {
+		t.Errorf("expected status='accepted', got %q", respBody.Status)
+	}
+}
+
+// TestHandleEcosystemStartUpgrade_IdempotencyKey_SecondRequestDoesNotCreateANewJob
+// is the direct end-to-end regression test for idempotency.Middleware
+// actually being wired into this specific route correctly — a retry
+// with the same Idempotency-Key must not start a second, duplicate
+// upgrade job.
+func TestHandleEcosystemStartUpgrade_IdempotencyKey_SecondRequestDoesNotCreateANewJob(t *testing.T) {
+	srv, clientID, clientSecret := newTestServerWithServiceAuthAndUpgrade(t, []string{"pgarchimigrator.upgrade"})
+	tokenForm := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret}}
+	tokenRec := doOAuthRequest(t, srv, tokenForm)
+	var tokenBody map[string]any
+	_ = json.Unmarshal(tokenRec.Body.Bytes(), &tokenBody)
+	rawToken, _ := tokenBody["access_token"].(string)
+
+	body, _ := json.Marshal(map[string]string{"sourceDsn": "postgresql://nonexistent/db", "targetDsn": "postgresql://nonexistent/db"})
+
+	makeRequest := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/upgrades", strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+rawToken)
+		req.Header.Set("Idempotency-Key", "retry-test-key-1")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec1 := makeRequest()
+	rec2 := makeRequest()
+
+	if rec1.Code != http.StatusAccepted || rec2.Code != http.StatusAccepted {
+		t.Fatalf("expected both requests to return 202, got %d and %d", rec1.Code, rec2.Code)
+	}
+
+	var resp1, resp2 operationAcceptedResponseForTest
+	_ = json.Unmarshal(rec1.Body.Bytes(), &resp1)
+	_ = json.Unmarshal(rec2.Body.Bytes(), &resp2)
+
+	if resp1.OperationID != resp2.OperationID {
+		t.Errorf("expected the SAME job id from both requests (no duplicate job created), got %q and %q", resp1.OperationID, resp2.OperationID)
+	}
+	if rec2.Header().Get("Idempotency-Replayed") != "true" {
+		t.Error("expected the second response to be marked as replayed")
+	}
+}
+
+// --- Retry endpoint tests ---
+
+// TestHandleRetryMigration_CreatesNewJobWithSameParameters is the
+// direct regression test for buildMigrationRequestFromJob actually
+// round-tripping a job's own operation parameters correctly — starts a
+// real migration, retries it, and confirms the NEW job has the exact
+// same schema/table/operation/column, not just "some job got created."
+func TestHandleRetryMigration_CreatesNewJobWithSameParameters(t *testing.T) {
+	srv, users := newTestServer(t, newFakeStore(), &fakeFlow{})
+
+	startBody := map[string]any{"table": "orders", "operation": "ADD_COLUMN", "column": "total", "type": "numeric"}
+	startRec := doRequest(t, srv, http.MethodPost, "/api/migrations", startBody, users.operator)
+	if startRec.Code != http.StatusOK {
+		t.Fatalf("expected the initial migration to start with 200, got %d: %s", startRec.Code, startRec.Body.String())
+	}
+	var original map[string]any
+	_ = json.Unmarshal(startRec.Body.Bytes(), &original)
+	originalID, _ := original["JobID"].(string)
+	if originalID == "" {
+		t.Fatalf("expected a JobID in the start response, got: %s", startRec.Body.String())
+	}
+
+	retryRec := doRequest(t, srv, http.MethodPost, "/api/migrations/"+originalID+"/retry", nil, users.operator)
+	if retryRec.Code != http.StatusOK {
+		t.Fatalf("expected the retry to return 200, got %d: %s", retryRec.Code, retryRec.Body.String())
+	}
+	var retried map[string]any
+	_ = json.Unmarshal(retryRec.Body.Bytes(), &retried)
+	retriedID, _ := retried["JobID"].(string)
+
+	if retriedID == "" || retriedID == originalID {
+		t.Errorf("expected a NEW, distinct job id from retry, got %q (original was %q)", retriedID, originalID)
+	}
+	if retried["TableName"] != "orders" {
+		t.Errorf("expected TableName='orders' to carry over, got %v", retried["TableName"])
+	}
+	if retried["Operation"] != "ADD_COLUMN" {
+		t.Errorf("expected Operation='ADD_COLUMN' to carry over, got %v", retried["Operation"])
+	}
+	if retried["ColumnName"] != "total" {
+		t.Errorf("expected ColumnName='total' to carry over, got %v", retried["ColumnName"])
+	}
+}
+
+func TestHandleRetryMigration_UnknownID_Returns404(t *testing.T) {
+	srv, users := newTestServer(t, newFakeStore(), &fakeFlow{})
+	rec := doRequest(t, srv, http.MethodPost, "/api/migrations/nonexistent-job-id/retry", nil, users.operator)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rec.Code)
+	}
+}
+
+// TestHandleRetryUpgrade_CreatesNewJobWithSameConnectionInfo is the
+// direct regression test for handleRetryUpgrade's own central promise:
+// a retry needs ZERO re-entry of connection info (including passwords),
+// because it's read entirely server-side from the original job.
+func TestHandleRetryUpgrade_CreatesNewJobWithSameConnectionInfo(t *testing.T) {
+	srv, users := newTestServerWithUpgrade(t)
+
+	startBody := map[string]any{
+		"sourceDsn": "postgresql://user:secret@nonexistent-host/db",
+		"targetDsn": "postgresql://user:secret@nonexistent-host2/db",
+		"schemas":   []string{"public", "billing"},
+	}
+	startRec := doRequest(t, srv, http.MethodPost, "/api/upgrades", startBody, users.admin)
+	if startRec.Code != http.StatusAccepted {
+		t.Fatalf("expected the initial upgrade to start with 202, got %d: %s", startRec.Code, startRec.Body.String())
+	}
+	var original map[string]string
+	_ = json.Unmarshal(startRec.Body.Bytes(), &original)
+	originalID := original["id"]
+
+	retryRec := doRequest(t, srv, http.MethodPost, "/api/upgrades/"+originalID+"/retry", nil, users.admin)
+	if retryRec.Code != http.StatusAccepted {
+		t.Fatalf("expected the retry to return 202, got %d: %s", retryRec.Code, retryRec.Body.String())
+	}
+	var retried map[string]string
+	_ = json.Unmarshal(retryRec.Body.Bytes(), &retried)
+	if retried["id"] == "" || retried["id"] == originalID {
+		t.Errorf("expected a NEW, distinct job id from retry, got %q (original was %q)", retried["id"], originalID)
+	}
+
+	// The real proof: fetch the new job and confirm its own connection
+	// info matches the original — read server-side, never resubmitted
+	// by the client.
+	detailRec := doRequest(t, srv, http.MethodGet, "/api/upgrades/"+retried["id"], nil, users.admin)
+	var detail map[string]any
+	_ = json.Unmarshal(detailRec.Body.Bytes(), &detail)
+	if detail["SourceConnectionRef"] != "postgresql://user:secret@nonexistent-host/db" {
+		t.Errorf("expected SourceConnectionRef to carry over from the original job, got %v", detail["SourceConnectionRef"])
+	}
+}
+
+func TestHandleRetryUpgrade_UnknownID_Returns404(t *testing.T) {
+	srv, users := newTestServerWithUpgrade(t)
+	rec := doRequest(t, srv, http.MethodPost, "/api/upgrades/nonexistent-job-id/retry", nil, users.admin)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rec.Code)
+	}
+}
+
+func TestHandleRetryUpgrade_NotConfigured_Returns503(t *testing.T) {
+	srv, users := newTestServer(t, newFakeStore(), &fakeFlow{})
+	rec := doRequest(t, srv, http.MethodPost, "/api/upgrades/some-id/retry", nil, users.admin)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", rec.Code)
+	}
+}
+
+// --- rebuildReplicationRef: verified end to end against real DSN
+// strings in a standalone script before being ported here (this
+// package's own pgx dependency means it can't be exercised with real
+// go test in this sandbox — see docs/TESTING.md's own note on this
+// constraint) — these are the exact same cases, now living alongside
+// the function itself for CI.
+
+func TestRebuildReplicationRef_HostAndPort(t *testing.T) {
+	got, err := rebuildReplicationRef("postgresql://pgarchimigrator:pgarchimigrator_dev_only@localhost:55432/pgarchimigrator_test?sslmode=disable", "pg-logical", "5432")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "postgresql://pgarchimigrator:pgarchimigrator_dev_only@pg-logical:5432/pgarchimigrator_test?sslmode=disable"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestRebuildReplicationRef_HostOnly_PreservesOriginalPort is the
+// direct regression test for a real gap found while verifying this
+// function: a host-only override (port left blank) must keep the
+// ORIGINAL non-default port, not silently fall back to PostgreSQL's
+// own default (5432) — losing a genuinely non-default port like 55432
+// would itself break the very retry this feature exists to fix.
+func TestRebuildReplicationRef_HostOnly_PreservesOriginalPort(t *testing.T) {
+	got, err := rebuildReplicationRef("postgresql://user:pass@localhost:55432/db", "pg-logical", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "postgresql://user:pass@pg-logical:55432/db"
+	if got != want {
+		t.Errorf("got %q, want %q (the original :55432 must survive a host-only override)", got, want)
+	}
+}
+
+func TestRebuildReplicationRef_PortOnly(t *testing.T) {
+	got, err := rebuildReplicationRef("postgresql://user:pass@localhost:55432/db", "", "5433")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "postgresql://user:pass@localhost:5433/db"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestRebuildReplicationRef_PreservesSpecialCharactersInPassword(t *testing.T) {
+	got, err := rebuildReplicationRef("postgresql://user:p%40ss@localhost:55432/db", "pg-logical", "5432")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "postgresql://user:p%40ss@pg-logical:5432/db"
+	if got != want {
+		t.Errorf("got %q, want %q — the password must survive byte-for-byte, unread and unmodified", got, want)
+	}
+}
+
+// TestHandleRetryUpgrade_WithReplicationOverride_RebuildsSourceReplicationRef
+// is the direct regression test for the real, repeated bug report this
+// override exists to fix: a retry whose ORIGINAL job never had a
+// working SourceReplicationRef predictably failed the same way every
+// time, with no way to correct it short of starting an entirely new
+// database migration. A caller can now supply just a host/port in the
+// retry request body and get a NEW job whose SourceReplicationRef is
+// rebuilt from it — the password is never part of the request at all.
+func TestHandleRetryUpgrade_WithReplicationOverride_RebuildsSourceReplicationRef(t *testing.T) {
+	srv, users := newTestServerWithUpgrade(t)
+
+	startBody := map[string]any{
+		"sourceDsn": "postgresql://user:secret@localhost:55432/db",
+		"targetDsn": "postgresql://user:secret@localhost:55434/db",
+	}
+	startRec := doRequest(t, srv, http.MethodPost, "/api/upgrades", startBody, users.admin)
+	var original map[string]string
+	_ = json.Unmarshal(startRec.Body.Bytes(), &original)
+
+	retryBody := map[string]any{"replicationHost": "pg-logical"}
+	retryRec := doRequest(t, srv, http.MethodPost, "/api/upgrades/"+original["id"]+"/retry", retryBody, users.admin)
+	if retryRec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", retryRec.Code, retryRec.Body.String())
+	}
+	var retried map[string]string
+	_ = json.Unmarshal(retryRec.Body.Bytes(), &retried)
+
+	detailRec := doRequest(t, srv, http.MethodGet, "/api/upgrades/"+retried["id"], nil, users.admin)
+	var detail map[string]any
+	_ = json.Unmarshal(detailRec.Body.Bytes(), &detail)
+
+	got, _ := detail["SourceReplicationRef"].(string)
+	want := "postgresql://user:secret@pg-logical:55432/db"
+	if got != want {
+		t.Errorf("expected SourceReplicationRef %q, got %q", want, got)
 	}
 }

@@ -167,7 +167,7 @@ export default function Dashboard() {
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-lg font-medium text-ink-800">Migrations</h1>
+          <h1 className="text-lg font-medium text-ink-800">Zero-Downtime Migration</h1>
           <p className="text-sm text-ink-500">Every schema change tracked from start to rollback window.</p>
         </div>
         <div className="flex items-center gap-2">
@@ -318,7 +318,7 @@ export default function Dashboard() {
       {filteredJobs && filteredJobs.length > 0 && (
         <Card className="overflow-hidden">
           <div className="overflow-x-auto">
-            <table aria-label="Migrations" className="w-full text-sm">
+            <table aria-label="Zero-Downtime Migration" className="w-full text-sm">
               <thead>
                 <tr className="border-b border-ink-100 bg-ink-50 text-left text-xs uppercase tracking-wide text-ink-400">
                   <th className="px-5 py-3 font-medium">Table</th>

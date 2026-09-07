@@ -40,7 +40,7 @@ import NewMigration from "./NewMigration";
 function renderScreen() {
   return render(
     <AuthProvider>
-      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <MemoryRouter>
         <NewMigration />
       </MemoryRouter>
     </AuthProvider>,
@@ -243,8 +243,9 @@ describe("NewMigration — connection info banner", () => {
       .mockResolvedValue({ Host: "db.internal", Port: 5432, Username: "pgarchimigrator", Database: "orders_prod", PostgresVersion: 16, PostgresVersionString: "PostgreSQL 16.4", VersionSupportStatus: "supported" });
     renderScreen();
 
-    expect(await screen.findByText("Connected to")).toBeInTheDocument();
-    expect(screen.getByText("db.internal:5432")).toBeInTheDocument();
+    expect(await screen.findByText("Hostname/IP")).toBeInTheDocument();
+    expect(screen.getByText("db.internal")).toBeInTheDocument();
+    expect(screen.getByText("5432")).toBeInTheDocument();
     expect(screen.getByText("orders_prod")).toBeInTheDocument();
     expect(screen.getByText("pgarchimigrator")).toBeInTheDocument();
   });
@@ -255,7 +256,7 @@ describe("NewMigration — connection info banner", () => {
       .mockResolvedValue({ Host: "db.internal", Port: 5432, Username: "pgarchimigrator", Database: "orders_prod", PostgresVersion: 16, PostgresVersionString: "PostgreSQL 16.4", VersionSupportStatus: "supported" });
     renderScreen();
 
-    await screen.findByText("Connected to");
+    await screen.findByText("Hostname/IP");
     // None of Host/Port/Username should ever appear as a form control's
     // accessible name — this is a display banner, not a form.
     expect(screen.queryByLabelText(/host/i)).not.toBeInTheDocument();
@@ -303,7 +304,7 @@ describe("NewMigration — connection info banner", () => {
     });
     renderScreen();
 
-    await screen.findByText("Connected to");
+    await screen.findByText("Hostname/IP");
     expect(screen.queryByText(/PostgreSQL \d/)).not.toBeInTheDocument();
   });
 });
@@ -633,5 +634,197 @@ describe("NewMigration — write load check (SHADOW_TABLE only)", () => {
     await user.click(screen.getByRole("button", { name: /check current write load/i }));
 
     expect(await screen.findByText("could not sample WAL position")).toBeInTheDocument();
+  });
+});
+
+describe("NewMigration — new operations (RENAME_TABLE, ADD_FOREIGN_KEY, ADD_GENERATED_COLUMN, PARTITION_TABLE)", () => {
+  beforeEach(() => {
+    vi.mocked(api.me).mockReset().mockResolvedValue({ id: "u1", email: "op@b.com", role: "operator" });
+    vi.mocked(api.listSchemas).mockReset().mockResolvedValue(["public"]);
+    // Two tables — ADD_FOREIGN_KEY's own "Referenced table" dropdown
+    // filters out whichever table is currently the SOURCE table (see
+    // NewMigration.tsx's own comment on that dropdown), so a single
+    // "orders" table alone would leave nothing selectable there.
+    vi.mocked(api.listTables).mockReset().mockResolvedValue(["orders", "customers", "products"]);
+    vi.mocked(api.listColumns)
+      .mockReset()
+      .mockImplementation(async (_schema: string, table: string) => {
+        if (table === "customers") {
+          return [
+            { Name: "id", Type: "integer", Nullable: false, IsPrimaryKey: true, Default: "" },
+            { Name: "name", Type: "text", Nullable: false, IsPrimaryKey: false, Default: "" },
+          ];
+        }
+        if (table === "products") {
+          return [{ Name: "sku", Type: "text", Nullable: false, IsPrimaryKey: true, Default: "" }];
+        }
+        return [{ Name: "customer_id", Type: "integer", Nullable: false, IsPrimaryKey: false, Default: "" }];
+      });
+    vi.mocked(api.sampleRows).mockReset().mockResolvedValue({ Columns: [], Rows: [] });
+    vi.mocked(api.getConnectionInfo)
+      .mockReset()
+      .mockResolvedValue({ Host: "localhost", Port: 5432, Username: "pgarchimigrator", Database: "pgarchimigrator_test", PostgresVersion: 16, PostgresVersionString: "PostgreSQL 16.4", VersionSupportStatus: "supported" });
+    vi.mocked(api.getTableStats)
+      .mockReset()
+      .mockResolvedValue({ SchemaName: "public", TableName: "orders", EstimatedRowCount: 0, IsPartitioned: false, HasPrimaryKey: true, ReplicaIdentity: "DEFAULT" });
+    vi.mocked(api.getStrategyMatrix)
+      .mockReset()
+      .mockResolvedValue({
+        RENAME_TABLE: ["DIRECT_DDL"],
+        ADD_FOREIGN_KEY: ["DIRECT_DDL"],
+        ADD_GENERATED_COLUMN: ["DIRECT_DDL", "EXPAND_BACKFILL"],
+        PARTITION_TABLE: ["SHADOW_TABLE"],
+      });
+    vi.mocked(api.previewMigration).mockReset();
+  });
+
+  async function selectTableAndOperation(user: ReturnType<typeof userEvent.setup>, operation: string) {
+    renderScreen();
+    const tableSelect = await screen.findByRole("combobox", { name: /^table$/i });
+    await waitFor(() => expect(within(tableSelect).queryByRole("option", { name: "orders" })).not.toBeNull());
+    await user.selectOptions(tableSelect, "orders");
+
+    const operationSelect = await screen.findByRole("combobox", { name: /operation/i });
+    await user.selectOptions(operationSelect, operation);
+  }
+
+  it("shows the New table name field for RENAME_TABLE, and no Column field at all", async () => {
+    const user = userEvent.setup();
+    await selectTableAndOperation(user, "RENAME_TABLE");
+
+    expect(await screen.findByRole("textbox", { name: /new table name/i })).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: /^column$/i })).not.toBeInTheDocument();
+  });
+
+  // Direct regression test for the full RENAME_TABLE flow actually
+  // reaching a preview — filling in just the one required field
+  // (new_table_name, no column at all) must be enough to trigger
+  // previewMigration.
+  it("triggers a preview for RENAME_TABLE with only the new table name filled in", async () => {
+    vi.mocked(api.previewMigration).mockResolvedValue({
+      SchemaName: "public", TableName: "orders", Operation: "RENAME_TABLE",
+      Strategy: "DIRECT_DDL", EstimatedRows: 10, Statements: [], Warnings: [], Notes: [],
+    });
+    const user = userEvent.setup();
+    await selectTableAndOperation(user, "RENAME_TABLE");
+
+    const newTableNameField = await screen.findByRole("textbox", { name: /new table name/i });
+    await user.type(newTableNameField, "orders_v2");
+
+    await waitFor(() => expect(api.previewMigration).toHaveBeenCalled());
+  });
+
+  it("shows constraint name, referenced table/column dropdowns (excluding the source table), and an on-delete dropdown for ADD_FOREIGN_KEY", async () => {
+    const user = userEvent.setup();
+    await selectTableAndOperation(user, "ADD_FOREIGN_KEY");
+
+    expect(await screen.findByRole("textbox", { name: /constraint name/i })).toBeInTheDocument();
+
+    // Direct regression test for the actual ask: Referenced table is a
+    // dropdown of REAL existing tables, excluding "orders" (the
+    // already-selected SOURCE table) — not a free-text field.
+    const referencedTableSelect = screen.getByRole("combobox", { name: /referenced table/i });
+    expect(within(referencedTableSelect).getByRole("option", { name: "customers" })).toBeInTheDocument();
+    expect(within(referencedTableSelect).queryByRole("option", { name: "orders" })).not.toBeInTheDocument();
+
+    await user.selectOptions(referencedTableSelect, "customers");
+
+    // Direct regression test for Referenced column being populated from
+    // the CHOSEN referenced table's own real columns, with the primary
+    // key ("id") clearly marked.
+    const referencedColumnSelect = await screen.findByRole("combobox", { name: /referenced column/i });
+    expect(await within(referencedColumnSelect).findByRole("option", { name: /id — primary key/i })).toBeInTheDocument();
+    expect(within(referencedColumnSelect).getByRole("option", { name: "name" })).toBeInTheDocument();
+
+    const onDeleteSelect = screen.getByRole("combobox", { name: /on delete/i });
+    expect(within(onDeleteSelect).getByRole("option", { name: "CASCADE" })).toBeInTheDocument();
+  });
+
+  // Direct regression test for changing the referenced table resetting
+  // any previously chosen referenced column — an already-selected
+  // column from the OLD referenced table would otherwise silently
+  // remain selected even though it may not even exist on the new one.
+  it("resets the referenced column when the referenced table is changed", async () => {
+    const user = userEvent.setup();
+    await selectTableAndOperation(user, "ADD_FOREIGN_KEY");
+
+    const referencedTableSelect = screen.getByRole("combobox", { name: /referenced table/i });
+    await user.selectOptions(referencedTableSelect, "customers");
+
+    const referencedColumnSelect = await screen.findByRole("combobox", { name: /referenced column/i });
+    await user.selectOptions(referencedColumnSelect, "id");
+    expect(referencedColumnSelect).toHaveValue("id");
+
+    // Switch to a genuinely DIFFERENT referenced table ("products", not
+    // "customers" again) — re-selecting the SAME value wouldn't
+    // reliably fire onChange at all, so this needs a real change to
+    // actually exercise the reset logic.
+    await user.selectOptions(referencedTableSelect, "products");
+    expect(referencedColumnSelect).toHaveValue("");
+  });
+
+  it("shows the Generated expression field for ADD_GENERATED_COLUMN, and a free-text Column field (not a dropdown)", async () => {
+    const user = userEvent.setup();
+    await selectTableAndOperation(user, "ADD_GENERATED_COLUMN");
+
+    expect(await screen.findByRole("textbox", { name: /generated expression/i })).toBeInTheDocument();
+    // The column here is being CREATED (like ADD_COLUMN's own column
+    // field), so it must be free text, not a dropdown fed by existing
+    // columns — see needsExistingColumn's own doc comment.
+    expect(screen.getByRole("textbox", { name: /^column/i })).toBeInTheDocument();
+  });
+
+  it("shows partition column, strategy, bounds, and the DEFAULT-partition checkbox for PARTITION_TABLE — and no Column field", async () => {
+    const user = userEvent.setup();
+    await selectTableAndOperation(user, "PARTITION_TABLE");
+
+    expect(await screen.findByRole("textbox", { name: /partition column/i })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: /partition strategy/i })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /DEFAULT partition/i })).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: /^column$/i })).not.toBeInTheDocument();
+  });
+
+  // Direct regression test for the rule-based shortcut's own visibility
+  // rule: it must only appear for RANGE (LIST has no equivalent — see
+  // strategy.ExpandPartitionRule's own doc comment), not unconditionally
+  // once PARTITION_TABLE is selected.
+  it("only shows the interval rule shortcut once RANGE is selected as the partition strategy, not for LIST", async () => {
+    const user = userEvent.setup();
+    await selectTableAndOperation(user, "PARTITION_TABLE");
+    await screen.findByRole("textbox", { name: /partition column/i });
+
+    expect(screen.queryByRole("combobox", { name: /^interval$/i })).not.toBeInTheDocument();
+
+    const strategySelect = screen.getByRole("combobox", { name: /partition strategy/i });
+    await user.selectOptions(strategySelect, "LIST");
+    expect(screen.queryByRole("combobox", { name: /^interval$/i })).not.toBeInTheDocument();
+
+    await user.selectOptions(strategySelect, "RANGE");
+    expect(screen.getByRole("combobox", { name: /^interval$/i })).toBeInTheDocument();
+  });
+
+  // Direct regression test for the full PARTITION_TABLE flow reaching a
+  // preview via the rule-based shortcut specifically (not explicit JSON
+  // bounds) — proving isReadyForPreview's rule-completeness check and
+  // the actual form wiring agree with each other end to end.
+  it("triggers a preview for PARTITION_TABLE using the rule-based shortcut, with no explicit JSON bounds typed in", async () => {
+    vi.mocked(api.previewMigration).mockResolvedValue({
+      SchemaName: "public", TableName: "orders", Operation: "PARTITION_TABLE",
+      Strategy: "SHADOW_TABLE", EstimatedRows: 10, Statements: [], Warnings: [], Notes: [],
+    });
+    const user = userEvent.setup();
+    await selectTableAndOperation(user, "PARTITION_TABLE");
+
+    await user.type(await screen.findByRole("textbox", { name: /partition column/i }), "created_at");
+    await user.selectOptions(screen.getByRole("combobox", { name: /partition strategy/i }), "RANGE");
+    await user.selectOptions(screen.getByRole("combobox", { name: /^interval$/i }), "monthly");
+    await user.type(screen.getByRole("textbox", { name: /^from$/i }), "2024-01-01");
+    await user.type(screen.getByRole("textbox", { name: /^to$/i }), "2024-04-01");
+
+    await waitFor(() => expect(api.previewMigration).toHaveBeenCalled());
+    const calls = vi.mocked(api.previewMigration).mock.calls;
+    const call = calls[calls.length - 1]?.[0];
+    expect(call?.partition_bounds).toBeUndefined();
+    expect(call?.partition_interval).toBe("monthly");
   });
 });

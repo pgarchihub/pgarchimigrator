@@ -39,7 +39,7 @@ so anything familiar from the web UI or API carries over directly.
 | `description` | No | Purely documentation — shown in CLI output and the resulting job's Description field. |
 | `schema` | No | Defaults to `public`. |
 | `table` | Yes | |
-| `operation` | Yes | One of `ADD_COLUMN`, `DROP_COLUMN`, `ALTER_COLUMN_TYPE`, `ADD_INDEX`, `DROP_INDEX`, `SET_NOT_NULL`, `ADD_CONSTRAINT`, `RENAME_COLUMN`. |
+| `operation` | Yes | One of `ADD_COLUMN`, `DROP_COLUMN`, `ALTER_COLUMN_TYPE`, `ADD_INDEX`, `DROP_INDEX`, `SET_NOT_NULL`, `ADD_CONSTRAINT`, `RENAME_COLUMN`, `RENAME_TABLE`, `ADD_FOREIGN_KEY`, `ADD_GENERATED_COLUMN`, `PARTITION_TABLE`. |
 | `column` | Operation-dependent | See `pgarchimigrator migrate --help` for exactly which operations require it — the same rules apply here. |
 | `type` | For `ADD_COLUMN`/`ALTER_COLUMN_TYPE` | |
 | `default` | No | Default value expression for `ADD_COLUMN`, e.g. `"'active'"` or `"now()"`. |
@@ -48,6 +48,16 @@ so anything familiar from the web UI or API carries over directly.
 | `constraint_name` | For `ADD_CONSTRAINT` (required) | |
 | `check_expression` | For `ADD_CONSTRAINT` (required) | e.g. `"price > 0"`. |
 | `new_column_name` | For `RENAME_COLUMN` (required) | |
+| `new_table_name` | For `RENAME_TABLE` (required) | No `column` field needed for this operation — it acts on the table itself, not any particular column. Leaves a backward-compatible VIEW under the old table name; see the Go doc comment on `strategy.OpRenameTable` for why. |
+| `referenced_table` | For `ADD_FOREIGN_KEY` (required) | The table the foreign key references, assumed to be in the same `schema`. |
+| `referenced_column` | For `ADD_FOREIGN_KEY` (required) | The referenced column — usually a primary key. `column` holds the *local* column for this operation. |
+| `on_delete` | For `ADD_FOREIGN_KEY` (optional) | One of `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT`, `NO ACTION`. Empty means PostgreSQL's own default (`NO ACTION`). Validated against exactly this list — see `strategy.ValidateOnDeleteAction`. |
+| `generated_expression` | For `ADD_GENERATED_COLUMN` (required) | The expression the new column's value is computed from, e.g. `"price * quantity"`. `column`/`type` hold the new column's name/type, same fields `ADD_COLUMN` uses. On a small table this becomes a real, native `GENERATED ALWAYS AS (...) STORED` column; on a large one, a plain column kept in sync by a trigger instead, to avoid the full-table-rewrite lock a native generated column would require — see the Go doc comment on `strategy.OpAddGeneratedColumn` for the full trade-off. |
+| `partition_column` | For `PARTITION_TABLE` (required) | The column values are partitioned on. |
+| `partition_strategy` | For `PARTITION_TABLE` (required) | `RANGE` or `LIST`. `HASH` isn't supported in this version — see `strategy.OpPartitionTable`. |
+| `partition_bounds` | For `PARTITION_TABLE` | An explicit array of `{"name": "...", "from": "...", "to": "..."}` (RANGE) or `{"name": "...", "values": ["...", "..."]}` (LIST) objects. Required for `LIST`; for `RANGE`, an alternative to the rule-based shortcut below. |
+| `partition_interval` / `partition_rule_from` / `partition_rule_to` | For `PARTITION_TABLE`, `RANGE` only | A convenience shortcut instead of writing out `partition_bounds` by hand — e.g. `partition_interval: "monthly"`, `partition_rule_from: "2024-01-01"`, `partition_rule_to: "2027-01-01"` generates 36 monthly partitions. `partition_interval` is one of `daily`, `monthly`, `yearly`; dates are `YYYY-MM-DD`. See `strategy.ExpandPartitionRule`. No equivalent exists for `LIST` — an algorithmically-generated set of category values doesn't make sense the way a calendar interval does, so `LIST` always requires explicit `partition_bounds`. |
+| `partition_include_default` | For `PARTITION_TABLE` (optional) | Adds a `DEFAULT` partition catching any row outside the explicit bounds. PostgreSQL requires either a `DEFAULT` partition or genuinely exhaustive bounds; recommended unless you're certain yours are exhaustive. |
 | `strategy_override` | No | Force `DIRECT_DDL`, `EXPAND_BACKFILL`, or `SHADOW_TABLE` — only combinations `internal/strategy`'s whitelist actually supports for the given operation are accepted; see that package's own validation for the incident that made this a hard requirement, not just a suggestion. |
 
 ## Directory convention
@@ -119,3 +129,15 @@ automatically against a temporary PostgreSQL instance whenever a pull
 request touches files under `migrations/`, and posts the result as a PR
 comment, so a reviewer sees the exact SQL and chosen strategy for every
 migration in the diff without needing to run anything locally.
+
+See also `.github/workflows/migration-apply.yml` for actually *running*
+a batch of migrations against a real database — deliberately the
+opposite of the preview workflow's automatic-on-every-PR trigger. This
+one only ever runs when a human opens the Actions tab, picks it
+manually, and types the literal word `APPLY` into a confirmation input;
+nothing about a git push or a PR merge on its own can trigger it. It
+previews first as a sanity check, and only proceeds to the real
+`apply-file` if that succeeds. Configure a `PGARCHIMIGRATOR_DATABASE_URL`
+secret pointing at your real database before using it — see the
+workflow file's own comments for how to scope that safely with a GitHub
+Environment.

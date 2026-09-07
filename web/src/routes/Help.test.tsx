@@ -47,14 +47,42 @@ describe("Help", () => {
     expect(issueLink).toHaveAttribute("target", "_blank");
   });
 
-  // Direct regression test for .github/FUNDING.yml actually having a
-  // matching, discoverable link inside the app itself — someone reading
-  // the Help page has no reason to know the repository page even has a
-  // "Sponsor" button unless this page also says so.
-  it("links to GitHub Sponsors", () => {
+  // Direct regression test for the pgArchiHub/ArchiOrbit Labs
+  // attribution replacing the earlier GitHub Sponsors link — see this
+  // file's own git history for that version.
+  it("links to pgArchiHub and credits ArchiOrbit Labs", () => {
     render(<Help />);
-    const sponsorLink = screen.getByRole("link", { name: /sponsor this project/i });
-    expect(sponsorLink).toHaveAttribute("href", "https://github.com/sponsors/pgarchihub");
-    expect(sponsorLink).toHaveAttribute("target", "_blank");
+    const familyLink = screen.getByRole("link", { name: "pgArchiHub" });
+    expect(familyLink).toHaveAttribute("href", "https://pgarchihub.com");
+    expect(familyLink).toHaveAttribute("target", "_blank");
+    expect(screen.getByText(/developed by ArchiOrbit Labs/i)).toBeInTheDocument();
+  });
+
+  it("no longer links to GitHub Sponsors", () => {
+    render(<Help />);
+    expect(screen.queryByRole("link", { name: /sponsor this project/i })).not.toBeInTheDocument();
+  });
+
+  // --- Changelog ---
+
+  it("shows a v2 section with the current release's own new features", () => {
+    render(<Help />);
+    expect(screen.getByText("v2")).toBeInTheDocument();
+    expect(screen.getByText(/12 operation types now, up from 8/i)).toBeInTheDocument();
+    expect(screen.getByText(/move an entire database/i)).toBeInTheDocument();
+    expect(screen.getByText(/retry a failed migration/i)).toBeInTheDocument();
+  });
+
+  it("shows a v1 section with the original release's own feature list", () => {
+    render(<Help />);
+    expect(screen.getByText("v1")).toBeInTheDocument();
+    expect(screen.getByText(/8 operation types/i)).toBeInTheDocument();
+  });
+
+  // Direct regression test for the actual ask: from this version
+  // onward, this build calls itself the Community Edition.
+  it("states that this version onward is the Community Edition", () => {
+    render(<Help />);
+    expect(screen.getByText(/community edition/i)).toBeInTheDocument();
   });
 });

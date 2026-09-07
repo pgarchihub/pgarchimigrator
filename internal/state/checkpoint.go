@@ -99,6 +99,66 @@ type Job struct {
 	// there is no corresponding Store.Update* setter for it.
 	NewColumnName string
 
+	// NewTableName is used ONLY by RENAME_TABLE — the table being
+	// renamed is this Job's own TableName; this field holds the name
+	// it's being renamed to. Same "no Update* setter" reasoning as
+	// NewColumnName just above — always caller-supplied at creation
+	// time, never mutated afterward.
+	NewTableName string
+
+	// The three fields below are used ONLY by ADD_FOREIGN_KEY — see
+	// strategy.ColumnChange.ReferencedTable's own doc comment for the
+	// full reasoning. ColumnName (already defined above) holds the
+	// LOCAL column; ConstraintName (already defined above, shared with
+	// SET_NOT_NULL/ADD_CONSTRAINT) holds the new constraint's name.
+	ReferencedTable  string
+	ReferencedColumn string
+	OnDelete         string
+
+	// GeneratedExpression is used ONLY by ADD_GENERATED_COLUMN — see
+	// strategy.ColumnChange.GeneratedExpression's own doc comment.
+	// ColumnName/ColumnType (already defined above) hold the new
+	// column's name/type, same fields ADD_COLUMN uses.
+	GeneratedExpression string
+
+	// The four fields below are used ONLY by PARTITION_TABLE — see
+	// strategy.ColumnChange's identical fields for the full reasoning
+	// (PartitionBoundsJSON always holds the final, explicit bounds,
+	// regardless of whether the caller originally specified them
+	// explicitly or via ExpandPartitionRule's convenience shortcut).
+	PartitionColumn         string
+	PartitionStrategy       string
+	PartitionBoundsJSON     string
+	PartitionIncludeDefault bool
+
+	// The three fields below carry Archi ecosystem correlation context
+	// (AC-PF-003 Section 12.1) for a job started BY the ecosystem (via
+	// the internal/ecosystem-aware API surface — see
+	// docs/ecosystem/ARCHITECTURE.md) — all three are empty for a job
+	// started directly through this product's own CLI/API/dashboard,
+	// outside any ArchiConsole-initiated journey. Persisted (not just
+	// threaded through in memory) specifically so internal/ecosystem.Store
+	// can populate every event this job's lifecycle produces — not just
+	// the first one — with the SAME correlation context, letting a
+	// consumer stitch together a job's entire history under one
+	// correlationId even though events are published from several
+	// different call sites over the job's lifetime.
+	//
+	// CorrelationID identifies the root cross-product request/workflow
+	// this job is one step of (Section 12.1: "Root request/workflow").
+	CorrelationID string
+	// CausationID identifies the specific command that caused THIS job
+	// to be created (Section 12.1: "the command/event that caused this
+	// event")
+	// — distinct from CorrelationID, which may span many jobs/products
+	// across one longer workflow.
+	CausationID string
+	// LifecycleID identifies the user-facing journey/entrypoint this job
+	// is part of (Section 12.1: "user journey continuity") — e.g.
+	// an ArchiConsole "upgrade this database" journey that this job is
+	// one concrete step within.
+	LifecycleID string
+
 	// EstimatedRowCount is the table's estimated row count at the moment
 	// the job was created (copied from the strategy.TableStats already
 	// fetched to decide the strategy — see orchestrator.StartMigration).

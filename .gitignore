@@ -32,3 +32,17 @@ web/dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Internal-only working documents — never published to the public
+# repository. These are Turkish-language internal notes (Claude-session
+# handoff continuity, internal competitive strategy, and this project's
+# own internal architecture/deployment decision log referencing
+# ArchiOrbit Labs' own internal standards and source specs) rather than
+# public project documentation. Kept locally for continuity across
+# development sessions, deliberately excluded from what a public
+# open-source clone ships.
+PROJECT_HANDOFF.md
+docs/COMPETITIVE_ANALYSIS.md
+docs/ecosystem/ARCHITECTURE.md
+docs/ecosystem/DEPLOYMENT.md
+docs/ecosystem/source-specs/

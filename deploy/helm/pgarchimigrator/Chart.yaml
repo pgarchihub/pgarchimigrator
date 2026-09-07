@@ -6,8 +6,8 @@ description: >-
   Deploys the REST API + dashboard server (`pgarchimigrator serve`) as a
   single-replica StatefulSet with persistent state storage.
 type: application
-version: 1.0.0
-appVersion: "1.0.0"
+version: 2.0.0
+appVersion: "2.0.0"
 keywords:
   - postgresql
   - database-migration

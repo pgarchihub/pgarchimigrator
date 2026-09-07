@@ -7,10 +7,9 @@ import (
 )
 
 // Analytics summarizes a set of jobs (typically every job the store
-// knows about) into the aggregate view Faz D of
-// pgArchiMigrator_Guven_Katmani_Tasarimi.md's roadmap calls for — "hangi
-// strateji ne sıklıkla kullanıldı, ortalama süre, başarısızlık oranı"
-// (which strategy is used how often, average duration, failure rate).
+// knows about) into the aggregate view Phase D of this project's own
+// internal Trust Layer Design Document roadmap calls for — which
+// strategy is used how often, average duration, failure rate.
 // Computed ENTIRELY from data the store already has (Job.Strategy/
 // Phase/CreatedAt/UpdatedAt) — no new database queries against the
 // target PostgreSQL server, no new cost beyond what listing jobs already

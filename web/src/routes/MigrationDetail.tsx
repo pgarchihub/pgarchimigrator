@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError } from "../lib/api";
 import type { MigrationReport, StageView } from "../lib/types";
 import { useAuth } from "../lib/auth";
@@ -32,8 +32,9 @@ interface HealthCheck {
 
 // computeHealthSummary distills everything else on this page into a
 // handful of pass/warn checks a DBA can read in five seconds — see
-// pgArchiMigrator_Guven_Katmani_Tasarimi.md's "3.6 — Sağlık Kartı" for
-// the design intent. Purely a presentational aggregation of data already
+// this project's own internal Trust Layer Design Document's "3.6 —
+// Health Card" section for the design intent. Purely a presentational
+// aggregation of data already
 // present in the Report (Stages, ResourceStatus) — no new backend work,
 // no new API calls; every signal here is already fetched for the rest of
 // this page anyway. Only called for a TERMINAL job — see this function's
@@ -52,6 +53,9 @@ interface HealthCheck {
 // executeExpandBackfill for what each operation's VALIDATING stage
 // actually does.
 function validatedSuccessDetail(job: MigrationReport): string {
+  if (job.Operation === "PARTITION_TABLE") {
+    return "Row counts/checksums matched between source and the new partitioned table, across every partition";
+  }
   if (job.Strategy === "SHADOW_TABLE") {
     return "Row counts/checksums matched between source and shadow table";
   }
@@ -196,11 +200,13 @@ function stepStatusIcon(label: string): ReactNode {
 
 export default function MigrationDetail() {
   const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const { hasRole } = useAuth();
   const [job, setJob] = useState<MigrationReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [rollingBack, setRollingBack] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   // Opt-in — see MigrationReport.ImpactActiveQueries's own doc comment
   // for why this one indicator, unlike every other trust-layer signal on
   // this page, isn't just always on: the underlying query has real,
@@ -252,6 +258,33 @@ export default function MigrationDetail() {
       setError(err instanceof ApiError ? err.message : "Rollback request failed.");
     } finally {
       setRollingBack(false);
+    }
+  }
+
+  // handleRetry starts a genuinely NEW migration with the same
+  // schema/table/operation parameters (see handleRetryMigration's own
+  // doc comment for why it's a new job, not a resumption of this one)
+  // — navigates straight to the new job's own detail page, since
+  // staying on THIS page would keep showing the old, failed job's own
+  // state after a successful retry.
+  async function handleRetry() {
+    if (!id) return;
+    setRetrying(true);
+    try {
+      const result = await api.retryMigration(id);
+      // See UpgradeDetail.tsx's own identical comment — reset this
+      // screen's state before navigating so the OLD failed job's
+      // banner/button doesn't flash while the new job's data loads.
+      setJob(null);
+      setLoading(true);
+      navigate(`/migrations/${result.JobID}`);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Retry request failed.");
+    } finally {
+      // Always reset, success or failure — never resetting on the
+      // success path left the button stuck on "Starting retry…"
+      // forever if navigation didn't visually take effect.
+      setRetrying(false);
     }
   }
 
@@ -655,6 +688,17 @@ export default function MigrationDetail() {
           <Button variant="danger" onClick={handleRollback} disabled={rollingBack}>
             {rollingBack ? "Rolling back…" : "Roll back this migration"}
           </Button>
+        </div>
+      )}
+
+      {job.Failed && (
+        <div>
+          <Button variant="secondary" onClick={handleRetry} disabled={retrying}>
+            {retrying ? "Starting retry…" : "Retry this migration"}
+          </Button>
+          <p className="mt-1.5 text-xs text-ink-400">
+            Starts a new migration with the same table and operation — nothing to re-enter.
+          </p>
         </div>
       )}
     </div>

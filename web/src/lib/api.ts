@@ -3,6 +3,7 @@ import type {
   ColumnInfo,
   ConnectionInfo,
   CurrentUser,
+  IntrospectSourceResponse,
   ManagedUser,
   MigrationReport,
   PreviewReport,
@@ -10,8 +11,11 @@ import type {
   SampleRowsResult,
   SetupRequiredResponse,
   StartMigrationRequest,
+  StartUpgradeRequest,
   StrategyMatrix,
   TableStats,
+  UpgradeDetail,
+  UpgradeJob,
   WriteLoadEstimate,
 } from "./types";
 
@@ -155,6 +159,29 @@ export const api = {
     throw new ApiError(res.status, message);
   },
 
+  // retryMigration mirrors rollbackMigration's own 200/422 handling —
+  // see that method's own comment for why (a job created but failing
+  // during Execute is still a real, inspectable outcome, not a generic
+  // error to discard LastError over).
+  retryMigration: async (id: string): Promise<MigrationReport> => {
+    const res = await fetch(`/api/migrations/${encodeURIComponent(id)}/retry`, {
+      method: "POST",
+      credentials: "same-origin",
+    });
+    if (res.status === 200 || res.status === 422) {
+      return (await res.json()) as MigrationReport;
+    }
+    let message = `request failed with status ${res.status}`;
+    try {
+      const body = (await res.json()) as { error?: string };
+      if (body.error) message = body.error;
+    } catch {
+      // body wasn't JSON — keep the generic message
+    }
+    notifyUnauthorized(res.status);
+    throw new ApiError(res.status, message);
+  },
+
   // --- Sweep ---
   sweep: () => request<unknown>("/api/sweep", { method: "POST" }),
 
@@ -187,4 +214,53 @@ export const api = {
   // — only called when the New Migration screen's opt-in "check current
   // write load" step is explicitly triggered, never automatically.
   estimateWriteLoad: () => request<WriteLoadEstimate>("/api/migrations/estimate-write-load", { method: "POST" }),
+
+  // --- Upgrades (internal/upgrade — whole-database PostgreSQL
+  // major-version upgrades, distinct from the single-table migrations
+  // above) ---
+  listUpgrades: () => request<UpgradeJob[]>("/api/upgrades"),
+  getUpgrade: (id: string) => request<UpgradeDetail>(`/api/upgrades/${encodeURIComponent(id)}`),
+  // Returns immediately (202 Accepted, internal/api's own
+  // operationAcceptedResponse shape) — unlike startMigration above,
+  // this does NOT wait for the operation to finish; internal/upgrade.Flow
+  // runs in the background for what can genuinely be hours. The caller
+  // is expected to navigate to the returned id's own detail page and
+  // let that screen's own polling (see UpgradeDetail.tsx) show live
+  // progress, the same way handleEcosystemStartMigration's own
+  // ecosystem callers are expected to poll GET /api/migrations/{id}.
+  startUpgrade: (body: StartUpgradeRequest) =>
+    request<{ id: string; status: string; statusUrl: string }>("/api/upgrades", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  // introspectUpgradeSource connects to an ARBITRARY source instance
+  // (the one the form's own Source fields currently describe) and
+  // returns its schema/table metadata — populates the checkbox picker
+  // BEFORE any job exists. See internal/api's own
+  // handleIntrospectUpgradeSource doc comment for why this grants no
+  // capability an admin didn't already have.
+  introspectUpgradeSource: (sourceDsn: string) =>
+    request<IntrospectSourceResponse>("/api/upgrades/introspect-source", {
+      method: "POST",
+      body: JSON.stringify({ sourceDsn }),
+    }),
+  // retryUpgrade needs no body at all in the common case — the server
+  // reads the original job's own already-stored connection info
+  // (including the source/target passwords) and reuses it entirely
+  // server-side. See handleRetryUpgrade's own doc comment for why this
+  // is exactly the point: zero re-entry, not even a resubmission of
+  // sensitive values through the browser.
+  //
+  // replicationOverride is the one exception — see
+  // rebuildReplicationRef's own doc comment on the Go side for why only
+  // host/port (never full credentials) are ever accepted here: the
+  // server rebuilds the new job's own SourceReplicationRef from the
+  // ORIGINAL job's stored connection string, so the password still
+  // never leaves the server, even when the retry's own replication
+  // address needs correcting.
+  retryUpgrade: (id: string, replicationOverride?: { replicationHost?: string; replicationPort?: string }) =>
+    request<{ id: string; status: string; statusUrl: string }>(`/api/upgrades/${encodeURIComponent(id)}/retry`, {
+      method: "POST",
+      body: replicationOverride ? JSON.stringify(replicationOverride) : undefined,
+    }),
 };

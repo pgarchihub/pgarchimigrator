@@ -78,6 +78,24 @@ var pendingColumnMigrations = []string{
 	// "measured and found to be zero" (see Job.ImpactPeakQueryDurationSeconds's
 	// own doc comment).
 	`ALTER TABLE jobs ADD COLUMN impact_peak_query_duration_seconds REAL`,
+	// Used ONLY by RENAME_TABLE — see Job.NewTableName's own doc comment.
+	`ALTER TABLE jobs ADD COLUMN new_table_name TEXT NOT NULL DEFAULT ''`,
+	// Used ONLY by ADD_FOREIGN_KEY — see Job.ReferencedTable's own doc comment.
+	`ALTER TABLE jobs ADD COLUMN referenced_table TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN referenced_column TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN on_delete TEXT NOT NULL DEFAULT ''`,
+	// Used ONLY by ADD_GENERATED_COLUMN — see Job.GeneratedExpression's own doc comment.
+	`ALTER TABLE jobs ADD COLUMN generated_expression TEXT NOT NULL DEFAULT ''`,
+	// Used ONLY by PARTITION_TABLE — see Job.PartitionColumn's own doc comment.
+	`ALTER TABLE jobs ADD COLUMN partition_column TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN partition_strategy TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN partition_bounds_json TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN partition_include_default INTEGER NOT NULL DEFAULT 0`,
+	// Used ONLY for jobs started via the ecosystem-aware API surface —
+	// see Job.CorrelationID's own doc comment.
+	`ALTER TABLE jobs ADD COLUMN correlation_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN causation_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN lifecycle_id TEXT NOT NULL DEFAULT ''`,
 }
 
 func migrateSchema(db *sql.DB) error {
@@ -150,8 +168,8 @@ func (s *SQLiteStore) Create(ctx context.Context, job *Job) error {
 			operation, column_name, column_type, default_value, is_volatile_default,
 			deprecated_column_name, index_name, index_definition,
 			constraint_name, check_expression, new_column_name,
-			estimated_row_count, rows_processed, name, description, impact_peak_query_duration_seconds
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			estimated_row_count, rows_processed, name, description, impact_peak_query_duration_seconds, new_table_name, referenced_table, referenced_column, on_delete, generated_expression, partition_column, partition_strategy, partition_bounds_json, partition_include_default, correlation_id, causation_id, lifecycle_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		job.ID, job.SchemaName, job.TableName, job.Strategy, string(job.Phase),
 		job.ReplicationSlotName, job.ShadowTableName,
@@ -162,6 +180,11 @@ func (s *SQLiteStore) Create(ctx context.Context, job *Job) error {
 		job.ConstraintName, job.CheckExpression, job.NewColumnName,
 		job.EstimatedRowCount, job.RowsProcessed, job.Name, job.Description,
 		job.ImpactPeakQueryDurationSeconds, // nil on creation — a brand new job hasn't had impact measured yet
+		job.NewTableName,
+		job.ReferencedTable, job.ReferencedColumn, job.OnDelete,
+		job.GeneratedExpression,
+		job.PartitionColumn, job.PartitionStrategy, job.PartitionBoundsJSON, job.PartitionIncludeDefault,
+		job.CorrelationID, job.CausationID, job.LifecycleID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create job (id=%s): %w", job.ID, err)
@@ -347,7 +370,7 @@ func (s *SQLiteStore) Get(ctx context.Context, jobID string) (*Job, error) {
 		SELECT id, schema_name, table_name, strategy, phase,
 		       replication_slot_name, shadow_table_name,
 		       created_at, updated_at, rollback_deadline, last_error,
-		       operation, column_name, column_type, default_value, is_volatile_default, deprecated_column_name, index_name, index_definition, constraint_name, check_expression, new_column_name, estimated_row_count, rows_processed, name, description, impact_peak_query_duration_seconds
+		       operation, column_name, column_type, default_value, is_volatile_default, deprecated_column_name, index_name, index_definition, constraint_name, check_expression, new_column_name, estimated_row_count, rows_processed, name, description, impact_peak_query_duration_seconds, new_table_name, referenced_table, referenced_column, on_delete, generated_expression, partition_column, partition_strategy, partition_bounds_json, partition_include_default, correlation_id, causation_id, lifecycle_id
 		FROM jobs WHERE id = ?
 	`, jobID)
 
@@ -381,7 +404,7 @@ func (s *SQLiteStore) ListStale(ctx context.Context, olderThan time.Duration) ([
 		SELECT id, schema_name, table_name, strategy, phase,
 		       replication_slot_name, shadow_table_name,
 		       created_at, updated_at, rollback_deadline, last_error,
-		       operation, column_name, column_type, default_value, is_volatile_default, deprecated_column_name, index_name, index_definition, constraint_name, check_expression, new_column_name, estimated_row_count, rows_processed, name, description, impact_peak_query_duration_seconds
+		       operation, column_name, column_type, default_value, is_volatile_default, deprecated_column_name, index_name, index_definition, constraint_name, check_expression, new_column_name, estimated_row_count, rows_processed, name, description, impact_peak_query_duration_seconds, new_table_name, referenced_table, referenced_column, on_delete, generated_expression, partition_column, partition_strategy, partition_bounds_json, partition_include_default, correlation_id, causation_id, lifecycle_id
 		FROM jobs
 		WHERE updated_at < ?
 		  AND phase NOT IN (?, ?, ?, ?)
@@ -411,7 +434,7 @@ func (s *SQLiteStore) ListExpiredRollbackWindows(ctx context.Context) ([]*Job, e
 		SELECT id, schema_name, table_name, strategy, phase,
 		       replication_slot_name, shadow_table_name,
 		       created_at, updated_at, rollback_deadline, last_error,
-		       operation, column_name, column_type, default_value, is_volatile_default, deprecated_column_name, index_name, index_definition, constraint_name, check_expression, new_column_name, estimated_row_count, rows_processed, name, description, impact_peak_query_duration_seconds
+		       operation, column_name, column_type, default_value, is_volatile_default, deprecated_column_name, index_name, index_definition, constraint_name, check_expression, new_column_name, estimated_row_count, rows_processed, name, description, impact_peak_query_duration_seconds, new_table_name, referenced_table, referenced_column, on_delete, generated_expression, partition_column, partition_strategy, partition_bounds_json, partition_include_default, correlation_id, causation_id, lifecycle_id
 		FROM jobs
 		WHERE phase = ?
 		  AND rollback_deadline IS NOT NULL
@@ -439,7 +462,7 @@ func (s *SQLiteStore) ListAll(ctx context.Context) ([]*Job, error) {
 		SELECT id, schema_name, table_name, strategy, phase,
 		       replication_slot_name, shadow_table_name,
 		       created_at, updated_at, rollback_deadline, last_error,
-		       operation, column_name, column_type, default_value, is_volatile_default, deprecated_column_name, index_name, index_definition, constraint_name, check_expression, new_column_name, estimated_row_count, rows_processed, name, description, impact_peak_query_duration_seconds
+		       operation, column_name, column_type, default_value, is_volatile_default, deprecated_column_name, index_name, index_definition, constraint_name, check_expression, new_column_name, estimated_row_count, rows_processed, name, description, impact_peak_query_duration_seconds, new_table_name, referenced_table, referenced_column, on_delete, generated_expression, partition_column, partition_strategy, partition_bounds_json, partition_include_default, correlation_id, causation_id, lifecycle_id
 		FROM jobs
 		ORDER BY created_at DESC
 	`)
@@ -482,7 +505,11 @@ func scanJob(row rowScanner) (*Job, error) {
 		&job.DeprecatedColumnName, &job.IndexName, &job.IndexDefinition,
 		&job.ConstraintName, &job.CheckExpression, &job.NewColumnName,
 		&job.EstimatedRowCount, &job.RowsProcessed, &job.Name, &job.Description,
-		&impactPeak,
+		&impactPeak, &job.NewTableName,
+		&job.ReferencedTable, &job.ReferencedColumn, &job.OnDelete,
+		&job.GeneratedExpression,
+		&job.PartitionColumn, &job.PartitionStrategy, &job.PartitionBoundsJSON, &job.PartitionIncludeDefault,
+		&job.CorrelationID, &job.CausationID, &job.LifecycleID,
 	); err != nil {
 		return nil, err
 	}

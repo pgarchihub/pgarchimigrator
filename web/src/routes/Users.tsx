@@ -182,18 +182,28 @@ export default function Users() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
             />
-            <label className="flex flex-col gap-1.5">
-              <span className="text-sm font-medium text-ink-700">Role</span>
-              <select
-                value={role}
-                onChange={(e) => setRole(e.target.value as Role)}
-                className="rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-800 focus:outline-none focus:ring-2 focus:ring-petrol-500 focus:border-petrol-500"
-              >
-                <option value="viewer">viewer</option>
-                <option value="operator">operator</option>
-                <option value="admin">admin</option>
-              </select>
-            </label>
+            {/* Wrapped in the same outer <div> TextField itself uses
+                (see TextField.tsx: an outer div plus an inner <label>,
+                not just a bare <label>) — a real alignment bug found
+                during manual testing: with `sm:items-end` aligning this
+                row's grid items to their own bottom edge, a shallower
+                DOM structure here than Email/Password's own ended up a
+                few pixels off from them instead of sitting flush along
+                the same baseline. */}
+            <div className="flex flex-col gap-1.5">
+              <label className="flex flex-col gap-1.5">
+                <span className="text-sm font-medium text-ink-700">Role</span>
+                <select
+                  value={role}
+                  onChange={(e) => setRole(e.target.value as Role)}
+                  className="rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-800 focus:outline-none focus:ring-2 focus:ring-petrol-500 focus:border-petrol-500"
+                >
+                  <option value="viewer">viewer</option>
+                  <option value="operator">operator</option>
+                  <option value="admin">admin</option>
+                </select>
+              </label>
+            </div>
             <div className="sm:col-span-3">
               {formError && <p className="mb-3 text-sm text-coral-500">{formError}</p>}
               <Button type="submit" disabled={submitting}>

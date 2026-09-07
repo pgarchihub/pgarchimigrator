@@ -519,3 +519,117 @@ func TestStartMigration_FlowBuilderError_ReturnsJobAndError(t *testing.T) {
 		t.Errorf("expected the job to have been persisted before the FlowFor failure, got %d", store.count())
 	}
 }
+
+// blockingFakeFlow's Execute blocks until unblock is closed — used to
+// deterministically test StartMigrationAsync's own core promise
+// (returns before Execute finishes) without a race-prone time.Sleep.
+type blockingFakeFlow struct {
+	unblock       chan struct{}
+	executeCalled chan struct{} // closed the moment Execute is entered
+	executeDone   chan struct{} // closed the moment Execute returns
+}
+
+func newBlockingFakeFlow() *blockingFakeFlow {
+	return &blockingFakeFlow{
+		unblock:       make(chan struct{}),
+		executeCalled: make(chan struct{}),
+		executeDone:   make(chan struct{}),
+	}
+}
+
+func (f *blockingFakeFlow) Execute(ctx context.Context, job *state.Job) error {
+	close(f.executeCalled)
+	<-f.unblock
+	close(f.executeDone)
+	return nil
+}
+
+func (f *blockingFakeFlow) Rollback(ctx context.Context, job *state.Job) error {
+	return nil
+}
+
+// TestStartMigrationAsync_ReturnsBeforeExecuteCompletes is the direct
+// regression test for StartMigrationAsync's entire reason for existing
+// — see its own doc comment. Uses blockingFakeFlow rather than a
+// time.Sleep-based check specifically so this test can't flake: it
+// deterministically proves the function returned while Execute was
+// still blocked inside its own <-f.unblock, not "returned quickly
+// enough that a sleep didn't catch it."
+func TestStartMigrationAsync_ReturnsBeforeExecuteCompletes(t *testing.T) {
+	store := newFakeStore()
+	flow := newBlockingFakeFlow()
+	o := orchestrator.New(store, func(strategy.Strategy) (orchestrator.Flow, error) { return flow, nil }, smallTableStats)
+
+	job, err := o.StartMigrationAsync(context.Background(), orchestrator.MigrationRequest{
+		SchemaName: "public", TableName: "orders", Change: fixedDefaultAddColumnChange(),
+	})
+	if err != nil {
+		t.Fatalf("StartMigrationAsync failed: %v", err)
+	}
+	if job == nil {
+		t.Fatal("expected a non-nil job")
+	}
+
+	select {
+	case <-flow.executeDone:
+		t.Fatal("expected Execute to still be blocked — StartMigrationAsync returned too late (or Execute wasn't actually backgrounded)")
+	default:
+		// Correct — Execute hasn't finished (in fact hasn't even
+		// necessarily started yet), and StartMigrationAsync already
+		// returned.
+	}
+
+	close(flow.unblock) // let the goroutine finish, so it doesn't leak past this test
+	<-flow.executeDone
+}
+
+// TestStartMigrationAsync_EventuallyExecutesInBackground confirms the
+// backgrounded Execute call genuinely happens (not silently dropped) —
+// the direct complement to the test above, which only checks it hasn't
+// happened YET.
+func TestStartMigrationAsync_EventuallyExecutesInBackground(t *testing.T) {
+	store := newFakeStore()
+	flow := newBlockingFakeFlow()
+	o := orchestrator.New(store, func(strategy.Strategy) (orchestrator.Flow, error) { return flow, nil }, smallTableStats)
+
+	_, err := o.StartMigrationAsync(context.Background(), orchestrator.MigrationRequest{
+		SchemaName: "public", TableName: "orders", Change: fixedDefaultAddColumnChange(),
+	})
+	if err != nil {
+		t.Fatalf("StartMigrationAsync failed: %v", err)
+	}
+
+	select {
+	case <-flow.executeCalled:
+		// Correct — Execute genuinely got called in the background.
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected Execute to eventually be called in the background")
+	}
+	close(flow.unblock)
+}
+
+// TestStartMigrationAsync_ValidationFailure_ReturnsSynchronously
+// confirms a request that fails validation BEFORE a job would even be
+// created (see prepareJob) returns its error immediately, synchronously
+// — there's no job, so there's nothing to background.
+func TestStartMigrationAsync_ValidationFailure_ReturnsSynchronously(t *testing.T) {
+	store := newFakeStore()
+	flow := &fakeFlow{}
+	statsErr := func(ctx context.Context, schema, table string) (strategy.TableStats, error) {
+		return strategy.TableStats{}, fmt.Errorf("could not reach the database")
+	}
+	o := orchestrator.New(store, func(strategy.Strategy) (orchestrator.Flow, error) { return flow, nil }, statsErr)
+
+	job, err := o.StartMigrationAsync(context.Background(), orchestrator.MigrationRequest{
+		SchemaName: "public", TableName: "orders", Change: fixedDefaultAddColumnChange(),
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if job != nil {
+		t.Error("expected a nil job when validation fails before any job is created")
+	}
+	if flow.executeCalled {
+		t.Error("expected Execute to never be called for a request that never got a job")
+	}
+}

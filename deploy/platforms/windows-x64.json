@@ -1,0 +1,9 @@
+{
+  "os": "windows",
+  "arch": "x64",
+  "goos": "windows",
+  "goarch": "amd64",
+  "archive": "zip",
+  "binaryName": "pgarchimigrator.exe",
+  "nativeSigningExpectation": "Authenticode for public native release — deferred, see AOL-STD-DEPLOY-001 §5.3; Community release ships this artifact unsigned beyond the Ed25519 artifact descriptor signature (scripts/sign-descriptor.sh)"
+}

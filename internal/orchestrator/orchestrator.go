@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -86,6 +87,16 @@ type MigrationRequest struct {
 	// apply identically regardless of Operation.
 	Name        string
 	Description string
+	// The three fields below carry Archi ecosystem correlation context
+	// (AC-PF-003 Section 12.1) for a migration started BY the ecosystem
+	// — see state.Job.CorrelationID's own doc comment for the full
+	// reasoning (same fields, same meaning; this is just where they
+	// enter the system before StartMigration copies them onto the new
+	// Job). All three are empty for a migration started directly
+	// through this product's own CLI/API/dashboard.
+	CorrelationID string
+	CausationID   string
+	LifecycleID   string
 }
 
 // StartMigration implements FR-01/FR-02/FR-03:
@@ -102,7 +113,32 @@ type MigrationRequest struct {
 // internal/ddlflow.DDLFlow.fail and
 // internal/shadowflow.ShadowFlow.failAndCleanup); StartMigration itself
 // does not attempt any additional cleanup.
-func (o *Orchestrator) StartMigration(ctx context.Context, req MigrationRequest) (*state.Job, error) {
+// preparedJob is prepareJob's return value — everything StartMigration
+// and StartMigrationAsync share, up to (and including) the point the
+// job is durably persisted, leaving only the actual flow.Execute call
+// (synchronous vs. backgrounded) to the two callers.
+type preparedJob struct {
+	job   *state.Job
+	flow  Flow
+	actor string
+}
+
+// prepareJob does everything StartMigration and StartMigrationAsync
+// have in common: validate the request, decide a strategy, create the
+// job checkpoint, and resolve which Flow will execute it. Deliberately
+// factored out so BOTH callers share the exact same validation logic
+// and job-creation shape — the only difference between "start a
+// migration and wait for it" and "start a migration and return
+// immediately" (see StartMigrationAsync's own doc comment for why that
+// second mode exists) should ever be how flow.Execute gets called, never
+// a second, independently-maintained copy of everything above it.
+//
+// Returns job == nil only when no job record was ever created at all
+// (a validation failure, or the table-stats/strategy-decision step
+// itself failing) — mirrors StartMigration's own pre-refactor "job ==
+// nil means nothing happened" contract exactly, so neither caller's
+// nil-handling needed to change.
+func (o *Orchestrator) prepareJob(ctx context.Context, req MigrationRequest) (*preparedJob, error) {
 	if o.VersionCheck != nil {
 		if err := o.VersionCheck(ctx); err != nil {
 			return nil, fmt.Errorf("preflight failed: %w", err)
@@ -154,25 +190,70 @@ func (o *Orchestrator) StartMigration(ctx context.Context, req MigrationRequest)
 			return nil, err
 		}
 	}
+	if err := strategy.ValidateOnDeleteAction(req.Change.OnDelete); err != nil {
+		return nil, err
+	}
+	if req.Change.GeneratedExpression != "" {
+		if err := strategy.ValidateSQLExpression(req.Change.GeneratedExpression, "generated expression"); err != nil {
+			return nil, err
+		}
+	}
+	if req.Change.Operation == strategy.OpPartitionTable {
+		if err := strategy.ValidatePartitionStrategy(req.Change.PartitionStrategy); err != nil {
+			return nil, err
+		}
+		var bounds []strategy.PartitionBound
+		if err := json.Unmarshal([]byte(req.Change.PartitionBoundsJSON), &bounds); err != nil {
+			return nil, fmt.Errorf("invalid partition bounds: %w", err)
+		}
+		if len(bounds) == 0 {
+			return nil, fmt.Errorf("partition bounds cannot be empty")
+		}
+		for _, b := range bounds {
+			if b.Name == "" {
+				return nil, fmt.Errorf("every partition bound needs a name")
+			}
+			for _, v := range append([]string{b.From, b.To}, b.Values...) {
+				if v == "" {
+					continue
+				}
+				if err := strategy.ValidateSQLExpression(v, "partition bound"); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
 
 	job := &state.Job{
-		ID:                o.newJobID(),
-		SchemaName:        req.SchemaName,
-		TableName:         req.TableName,
-		Strategy:          string(strat),
-		Phase:             state.PhasePreflight,
-		Operation:         string(req.Change.Operation),
-		ColumnName:        req.Change.ColumnName,
-		ColumnType:        req.Change.NewType,
-		DefaultValue:      req.Change.DefaultValue,
-		IsVolatileDefault: req.Change.IsVolatileDefault,
-		IndexName:         req.Change.IndexName,
-		ConstraintName:    req.Change.ConstraintName,
-		CheckExpression:   req.Change.CheckExpression,
-		NewColumnName:     req.Change.NewColumnName,
-		EstimatedRowCount: rawStats.EstimatedRowCount,
-		Name:              req.Name,
-		Description:       req.Description,
+		ID:                      o.newJobID(),
+		SchemaName:              req.SchemaName,
+		TableName:               req.TableName,
+		Strategy:                string(strat),
+		Phase:                   state.PhasePreflight,
+		Operation:               string(req.Change.Operation),
+		ColumnName:              req.Change.ColumnName,
+		ColumnType:              req.Change.NewType,
+		DefaultValue:            req.Change.DefaultValue,
+		IsVolatileDefault:       req.Change.IsVolatileDefault,
+		IndexName:               req.Change.IndexName,
+		ConstraintName:          req.Change.ConstraintName,
+		CheckExpression:         req.Change.CheckExpression,
+		NewColumnName:           req.Change.NewColumnName,
+		NewTableName:            req.Change.NewTableName,
+		ReferencedTable:         req.Change.ReferencedTable,
+		ReferencedColumn:        req.Change.ReferencedColumn,
+		OnDelete:                req.Change.OnDelete,
+		GeneratedExpression:     req.Change.GeneratedExpression,
+		PartitionColumn:         req.Change.PartitionColumn,
+		PartitionStrategy:       req.Change.PartitionStrategy,
+		PartitionBoundsJSON:     req.Change.PartitionBoundsJSON,
+		PartitionIncludeDefault: req.Change.PartitionIncludeDefault,
+		EstimatedRowCount:       rawStats.EstimatedRowCount,
+		Name:                    req.Name,
+		Description:             req.Description,
+		CorrelationID:           req.CorrelationID,
+		CausationID:             req.CausationID,
+		LifecycleID:             req.LifecycleID,
 		// NOTE: strategy.ColumnChange.TypeConversionCompatible is
 		// deliberately NOT copied here — it's only an input to
 		// strategy.Decide's strategy CHOICE, not state any flow needs
@@ -190,16 +271,84 @@ func (o *Orchestrator) StartMigration(ctx context.Context, req MigrationRequest)
 	flow, err := o.FlowFor(strat)
 	if err != nil {
 		o.logAudit(ctx, job.ID, actor, "MIGRATION_STARTED", "FAILURE", map[string]any{"error": err.Error()})
-		return job, fmt.Errorf("failed to obtain a flow for strategy %s: %w", strat, err)
+		// Unlike every branch above, a job DOES exist by this point —
+		// preserves StartMigration's original "return job, err" (not
+		// "nil, err") contract for this specific failure, so a caller
+		// can still inspect what WAS persisted even though nothing will
+		// ever execute against it.
+		return &preparedJob{job: job, actor: actor}, fmt.Errorf("failed to obtain a flow for strategy %s: %w", strat, err)
 	}
 
-	if err := flow.Execute(ctx, job); err != nil {
-		o.logAudit(ctx, job.ID, actor, "MIGRATION_EXECUTE", "FAILURE", map[string]any{"error": err.Error(), "phase": string(job.Phase)})
-		return job, fmt.Errorf("migration failed: %w", err)
+	return &preparedJob{job: job, flow: flow, actor: actor}, nil
+}
+
+// StartMigration validates req, creates a job checkpoint, and runs it
+// to completion SYNCHRONOUSLY — the caller doesn't get control back
+// until the migration has finished (successfully or not). This is what
+// every existing caller (the CLI, the cookie-authenticated human
+// dashboard API) has always done and continues to do unchanged; see
+// StartMigrationAsync for the alternative this refactor introduces
+// alongside it, not instead of it.
+func (o *Orchestrator) StartMigration(ctx context.Context, req MigrationRequest) (*state.Job, error) {
+	prepared, err := o.prepareJob(ctx, req)
+	if prepared == nil {
+		return nil, err
+	}
+	if err != nil {
+		return prepared.job, err
 	}
 
-	o.logAudit(ctx, job.ID, actor, "MIGRATION_EXECUTE", "SUCCESS", map[string]any{"phase": string(job.Phase)})
-	return job, nil
+	if err := prepared.flow.Execute(ctx, prepared.job); err != nil {
+		o.logAudit(ctx, prepared.job.ID, prepared.actor, "MIGRATION_EXECUTE", "FAILURE", map[string]any{"error": err.Error(), "phase": string(prepared.job.Phase)})
+		return prepared.job, fmt.Errorf("migration failed: %w", err)
+	}
+
+	o.logAudit(ctx, prepared.job.ID, prepared.actor, "MIGRATION_EXECUTE", "SUCCESS", map[string]any{"phase": string(prepared.job.Phase)})
+	return prepared.job, nil
+}
+
+// StartMigrationAsync mirrors StartMigration's exact validation and
+// job-creation logic (via the shared prepareJob) but runs flow.Execute
+// in a background goroutine rather than waiting for it, returning the
+// job as soon as it's durably created — its Phase will still be
+// PhasePreflight (or whatever prepareJob's error path left it at) at
+// the moment this function returns, not a terminal phase.
+//
+// This exists for internal/api's ecosystem-facing POST
+// /api/v1/migrations handler (see docs/ecosystem/ARCHITECTURE.md):
+// AC-PF-003 Section 13.2's "202 Accepted + operation reference" pattern
+// for command responses requires returning as soon as the job is
+// durably created, not waiting for it to finish — which can be minutes
+// to hours for a SHADOW_TABLE migration, far longer than any HTTP
+// client should be expected to block on.
+//
+// Deliberately runs Execute with context.Background(), not ctx — ctx is
+// the INCOMING HTTP request's context, which the http package cancels
+// the moment the handler returns (immediately after this function
+// hands back the job) — using it for the background Execute call would
+// abort the migration within moments of starting it. This mirrors how
+// internal/reaper's own background sweep loop is deliberately given its
+// own long-lived context rather than reusing whatever request triggered
+// it.
+func (o *Orchestrator) StartMigrationAsync(ctx context.Context, req MigrationRequest) (*state.Job, error) {
+	prepared, err := o.prepareJob(ctx, req)
+	if prepared == nil {
+		return nil, err
+	}
+	if err != nil {
+		return prepared.job, err
+	}
+
+	go func() {
+		bgCtx := context.Background()
+		if err := prepared.flow.Execute(bgCtx, prepared.job); err != nil {
+			o.logAudit(bgCtx, prepared.job.ID, prepared.actor, "MIGRATION_EXECUTE", "FAILURE", map[string]any{"error": err.Error(), "phase": string(prepared.job.Phase)})
+			return
+		}
+		o.logAudit(bgCtx, prepared.job.ID, prepared.actor, "MIGRATION_EXECUTE", "SUCCESS", map[string]any{"phase": string(prepared.job.Phase)})
+	}()
+
+	return prepared.job, nil
 }
 
 // RollbackMigration looks up a job and delegates to its Flow's Rollback,

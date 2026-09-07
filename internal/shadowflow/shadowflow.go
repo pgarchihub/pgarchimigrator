@@ -6,6 +6,7 @@ package shadowflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/pgarchihub/pgarchimigrator/internal/catalog"
 	"github.com/pgarchihub/pgarchimigrator/internal/db"
 	"github.com/pgarchihub/pgarchimigrator/internal/monitor"
 	"github.com/pgarchihub/pgarchimigrator/internal/orchestrator"
@@ -298,9 +300,18 @@ func (f *ShadowFlow) prepare(ctx context.Context, job *state.Job, names resource
 	sourceQualified := quoteIdent(job.SchemaName) + "." + quoteIdent(job.TableName)
 	shadowQualified := quoteIdent(job.SchemaName) + "." + quoteIdent(names.shadowTable)
 
-	createSQL := fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING ALL)", shadowQualified, sourceQualified)
-	if _, err := f.Pool.Exec(ctx, createSQL); err != nil {
-		return 0, fmt.Errorf("failed to create shadow table: %w", err)
+	if job.Operation == "PARTITION_TABLE" {
+		// See createPartitionedShadowTable's own doc comment for why
+		// this can't use the plain "CREATE TABLE (LIKE source INCLUDING
+		// ALL)" every other operation's shadow table uses below.
+		if err := f.createPartitionedShadowTable(ctx, job, names.shadowTable, shadowQualified); err != nil {
+			return 0, err
+		}
+	} else {
+		createSQL := fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING ALL)", shadowQualified, sourceQualified)
+		if _, err := f.Pool.Exec(ctx, createSQL); err != nil {
+			return 0, fmt.Errorf("failed to create shadow table: %w", err)
+		}
 	}
 
 	if castColumn != "" {
@@ -340,6 +351,145 @@ func (f *ShadowFlow) prepare(ctx context.Context, job *state.Job, names resource
 		return 0, err
 	}
 	return startLSN, nil
+}
+
+// quoteLiteral escapes and quotes a string for use as a SQL string
+// literal in DDL text — PostgreSQL DDL doesn't support parameter
+// binding (see this project's own recurring reasoning throughout
+// internal/ddlflow for why every DDL-inlined value needs its own
+// escaping mechanism suited to what kind of SQL token it is): quoteIdent
+// for identifiers, this for literal values like a partition bound.
+func quoteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// createPartitionedShadowTable builds the shadow table for
+// PARTITION_TABLE — see strategy.OpPartitionTable's own doc comment for
+// why this can't use prepare's usual "CREATE TABLE (LIKE source
+// INCLUDING ALL)": PostgreSQL doesn't allow combining LIKE with
+// PARTITION BY. Instead, this introspects the source table's actual
+// column definitions (via internal/catalog.ListColumns — the same
+// introspection the web UI's table-overview panel already uses) and
+// builds an explicit CREATE TABLE ... PARTITION BY statement, then
+// attaches each partition named in job.PartitionBoundsJSON (always the
+// final, explicit bounds by this point — see
+// strategy.ColumnChange.PartitionBoundsJSON's own doc comment for why
+// ExpandPartitionRule's convenience shortcut, if used, has already run
+// well before this).
+func (f *ShadowFlow) createPartitionedShadowTable(ctx context.Context, job *state.Job, shadowTableName, shadowQualified string) error {
+	if err := strategy.ValidatePartitionStrategy(job.PartitionStrategy); err != nil {
+		return err
+	}
+
+	columns, err := catalog.ListColumns(ctx, f.Pool, job.SchemaName, job.TableName)
+	if err != nil {
+		return fmt.Errorf("failed to introspect source table columns: %w", err)
+	}
+	if len(columns) == 0 {
+		return fmt.Errorf("source table %s.%s has no columns", job.SchemaName, job.TableName)
+	}
+
+	colDefs := make([]string, 0, len(columns))
+	for _, c := range columns {
+		// c.Type/c.Default come straight from PostgreSQL's own catalog
+		// for a table that already legitimately has this exact
+		// definition — unlike DefaultValue/CheckExpression/GeneratedExpression
+		// elsewhere in this project (caller-supplied, so blocklist-
+		// validated before use), this was already accepted by
+		// PostgreSQL itself when the source table was originally
+		// created, so no additional validation is warranted here.
+		def := quoteIdent(c.Name) + " " + c.Type
+		if !c.Nullable {
+			def += " NOT NULL"
+		}
+		if c.Default != "" {
+			def += " DEFAULT " + c.Default
+		}
+		colDefs = append(colDefs, def)
+	}
+
+	createSQL := fmt.Sprintf("CREATE TABLE %s (%s) PARTITION BY %s (%s)",
+		shadowQualified, strings.Join(colDefs, ", "), job.PartitionStrategy, quoteIdent(job.PartitionColumn))
+	if _, err := f.Pool.Exec(ctx, createSQL); err != nil {
+		return fmt.Errorf("failed to create partitioned shadow table: %w", err)
+	}
+
+	var bounds []strategy.PartitionBound
+	if err := json.Unmarshal([]byte(job.PartitionBoundsJSON), &bounds); err != nil {
+		return fmt.Errorf("failed to parse partition bounds: %w", err)
+	}
+	if len(bounds) == 0 {
+		return fmt.Errorf("no partition bounds specified")
+	}
+
+	for _, b := range bounds {
+		if err := createPartitionOf(ctx, f.Pool, job.SchemaName, shadowQualified, job.PartitionStrategy, b); err != nil {
+			return err
+		}
+	}
+
+	if job.PartitionIncludeDefault {
+		// Derived directly from the shadow table's own already-unique
+		// name (see resourceNamesFor — includes the job ID), so this
+		// can't collide with another job's DEFAULT partition even if
+		// two PARTITION_TABLE migrations happen to target tables with
+		// the same base name.
+		defaultName := shadowTableName + "_default"
+		defaultQualified := quoteIdent(job.SchemaName) + "." + quoteIdent(defaultName)
+		defaultSQL := fmt.Sprintf("CREATE TABLE %s PARTITION OF %s DEFAULT", defaultQualified, shadowQualified)
+		if _, err := f.Pool.Exec(ctx, defaultSQL); err != nil {
+			return fmt.Errorf("failed to create the DEFAULT partition: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// createPartitionOf attaches a single named partition to a partitioned
+// parent table, per b's RANGE (From/To) or LIST (Values) bound — see
+// strategy.PartitionBound's own doc comment for the shape.
+func createPartitionOf(ctx context.Context, pool *pgxpool.Pool, schema, parentQualified, partitionStrategy string, b strategy.PartitionBound) error {
+	if b.Name == "" {
+		return fmt.Errorf("a partition bound is missing a name")
+	}
+	partQualified := quoteIdent(schema) + "." + quoteIdent(b.Name)
+
+	var forValues string
+	switch partitionStrategy {
+	case "RANGE":
+		if b.From == "" || b.To == "" {
+			return fmt.Errorf("partition %q is missing a from/to bound (RANGE partitioning requires both)", b.Name)
+		}
+		if err := strategy.ValidateSQLExpression(b.From, "partition from bound"); err != nil {
+			return err
+		}
+		if err := strategy.ValidateSQLExpression(b.To, "partition to bound"); err != nil {
+			return err
+		}
+		forValues = fmt.Sprintf("FOR VALUES FROM (%s) TO (%s)", quoteLiteral(b.From), quoteLiteral(b.To))
+	case "LIST":
+		if len(b.Values) == 0 {
+			return fmt.Errorf("partition %q has no values (LIST partitioning requires at least one)", b.Name)
+		}
+		quoted := make([]string, len(b.Values))
+		for i, v := range b.Values {
+			if err := strategy.ValidateSQLExpression(v, "partition value"); err != nil {
+				return err
+			}
+			quoted[i] = quoteLiteral(v)
+		}
+		forValues = fmt.Sprintf("FOR VALUES IN (%s)", strings.Join(quoted, ", "))
+	default:
+		// Already validated by ValidatePartitionStrategy before this is
+		// ever called — defensive only.
+		return fmt.Errorf("unsupported partition strategy %q", partitionStrategy)
+	}
+
+	partSQL := fmt.Sprintf("CREATE TABLE %s PARTITION OF %s %s", partQualified, parentQualified, forValues)
+	if _, err := pool.Exec(ctx, partSQL); err != nil {
+		return fmt.Errorf("failed to create partition %q: %w", b.Name, err)
+	}
+	return nil
 }
 
 // startDeltaSync starts the SyncEngine in a background goroutine and

@@ -1,5 +1,6 @@
 import { type DependencyList, type FormEvent, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { Database as DatabaseIcon } from "lucide-react";
 import { api, ApiError } from "../lib/api";
 import type { ColumnInfo, ConnectionInfo, Operation, PreviewReport, SampleRowsResult, StartMigrationRequest, StrategyMatrix, TableStats, WriteLoadEstimate } from "../lib/types";
 import { useAuth } from "../lib/auth";
@@ -9,15 +10,34 @@ import { Card, CardBody, CardHeader } from "../ui/Card";
 import { Badge } from "../ui/Badge";
 import { TextField } from "../ui/TextField";
 
-const OPERATIONS: Operation[] = [
-  "ADD_COLUMN",
-  "DROP_COLUMN",
-  "ALTER_COLUMN_TYPE",
-  "ADD_INDEX",
-  "DROP_INDEX",
-  "SET_NOT_NULL",
-  "ADD_CONSTRAINT",
-  "RENAME_COLUMN",
+// OPERATION_GROUPS drives the Operation dropdown's own <optgroup>
+// structure — grouped by what the operation actually acts on (the
+// table itself, one of its columns, or one of its indexes), so
+// someone scanning 12 operations for "the one that touches indexes"
+// doesn't have to read every label. Each group gets its own shade of
+// petrol (the project's own single brand color) rather than reaching
+// for amber/coral — see tailwind.config.js's own comments: amber is
+// reserved strictly for "active/in progress" states and coral strictly
+// for destructive warnings, and reusing either here just for visual
+// grouping would blur a distinction those colors exist to protect
+// elsewhere in the app.
+const OPERATION_GROUPS: { label: string; colorClass: string; operations: Operation[] }[] = [
+  { label: "Table", colorClass: "text-petrol-800", operations: ["RENAME_TABLE", "PARTITION_TABLE"] },
+  {
+    label: "Column",
+    colorClass: "text-petrol-600",
+    operations: [
+      "ADD_COLUMN",
+      "DROP_COLUMN",
+      "ALTER_COLUMN_TYPE",
+      "SET_NOT_NULL",
+      "RENAME_COLUMN",
+      "ADD_GENERATED_COLUMN",
+      "ADD_FOREIGN_KEY",
+      "ADD_CONSTRAINT",
+    ],
+  },
+  { label: "Index", colorClass: "text-petrol-400", operations: ["ADD_INDEX", "DROP_INDEX"] },
 ];
 
 export interface FormState {
@@ -33,6 +53,25 @@ export interface FormState {
   constraint_name: string;
   check_expression: string;
   new_column_name: string;
+  new_table_name: string;
+  referenced_table: string;
+  referenced_column: string;
+  on_delete: string;
+  generated_expression: string;
+  partition_column: string;
+  partition_strategy: string;
+  partition_include_default: boolean;
+  // Explicit bounds, entered as raw JSON text — matches the CLI's own
+  // --partition-bounds flag design (rather than a fully dynamic
+  // multi-row bounds editor), so the same mental model works whether
+  // someone reaches for the web UI or the CLI. Parsed just before
+  // submission — see toRequest below.
+  partition_bounds_raw: string;
+  // The RANGE-only rule-based shortcut (see strategy.ExpandPartitionRule)
+  // — an alternative to partition_bounds_raw, not required alongside it.
+  partition_interval: string;
+  partition_rule_from: string;
+  partition_rule_to: string;
   name: string;
   description: string;
 }
@@ -50,11 +89,35 @@ export const initialForm: FormState = {
   constraint_name: "",
   check_expression: "",
   new_column_name: "",
+  new_table_name: "",
+  referenced_table: "",
+  referenced_column: "",
+  on_delete: "",
+  generated_expression: "",
+  partition_column: "",
+  partition_strategy: "",
+  partition_include_default: false,
+  partition_bounds_raw: "",
+  partition_interval: "",
+  partition_rule_from: "",
+  partition_rule_to: "",
   name: "",
   description: "",
 };
 
 function toRequest(f: FormState): StartMigrationRequest {
+  let partitionBounds: StartMigrationRequest["partition_bounds"];
+  if (f.operation === "PARTITION_TABLE" && f.partition_bounds_raw.trim()) {
+    try {
+      partitionBounds = JSON.parse(f.partition_bounds_raw);
+    } catch {
+      // Left undefined on a parse failure — the request will then fail
+      // server-side with a clear "invalid partition bounds" error
+      // rather than silently dropping what the user typed. The preview
+      // panel's own error display (see the request-error handling
+      // further down this file) surfaces that message directly.
+    }
+  }
   return {
     schema: f.schema || undefined,
     table: f.table,
@@ -68,6 +131,18 @@ function toRequest(f: FormState): StartMigrationRequest {
     constraint_name: f.constraint_name || undefined,
     check_expression: f.check_expression || undefined,
     new_column_name: f.new_column_name || undefined,
+    new_table_name: f.new_table_name || undefined,
+    referenced_table: f.referenced_table || undefined,
+    referenced_column: f.referenced_column || undefined,
+    on_delete: f.on_delete || undefined,
+    generated_expression: f.generated_expression || undefined,
+    partition_column: f.partition_column || undefined,
+    partition_strategy: f.partition_strategy || undefined,
+    partition_include_default: f.partition_include_default,
+    partition_bounds: partitionBounds,
+    partition_interval: f.partition_interval || undefined,
+    partition_rule_from: f.partition_rule_from || undefined,
+    partition_rule_to: f.partition_rule_to || undefined,
     name: f.name || undefined,
     description: f.description || undefined,
   };
@@ -89,6 +164,31 @@ export function isReadyForPreview(f: FormState): boolean {
       return !!f.column.trim() && !!f.new_column_name.trim();
     case "ALTER_COLUMN_TYPE":
       return !!f.column.trim() && !!f.type.trim();
+    case "RENAME_TABLE":
+      // No column involved at all — this operation acts on the table
+      // itself, matching internal/strategy.ColumnChange.NewTableName's
+      // own doc comment.
+      return !!f.new_table_name.trim();
+    case "ADD_FOREIGN_KEY":
+      return (
+        !!f.column.trim() &&
+        !!f.constraint_name.trim() &&
+        !!f.referenced_table.trim() &&
+        !!f.referenced_column.trim()
+      );
+    case "ADD_GENERATED_COLUMN":
+      return !!f.column.trim() && !!f.type.trim() && !!f.generated_expression.trim();
+    case "PARTITION_TABLE": {
+      // Also no column field — same reasoning as RENAME_TABLE. Bounds
+      // can come from EITHER the raw JSON textarea OR the RANGE-only
+      // rule shortcut (not both required) — see toRequest's own
+      // handling of partition_bounds_raw for how the textarea gets
+      // parsed at submission time.
+      if (!f.partition_column.trim() || !f.partition_strategy.trim()) return false;
+      const hasExplicitBounds = !!f.partition_bounds_raw.trim();
+      const hasRule = !!f.partition_interval.trim() && !!f.partition_rule_from.trim() && !!f.partition_rule_to.trim();
+      return hasExplicitBounds || hasRule;
+    }
     default: // ADD_COLUMN, DROP_COLUMN, ADD_INDEX, SET_NOT_NULL
       return !!f.column.trim();
   }
@@ -98,10 +198,19 @@ export function isReadyForPreview(f: FormState): boolean {
 // name a column that ALREADY exists (so it should be a dropdown fed by
 // ListColumns) rather than free text. ADD_COLUMN is the one exception —
 // its column is being CREATED, so it can never be picked from a list of
-// existing ones. DROP_INDEX/ADD_CONSTRAINT don't show a column field at
-// all (unchanged from before this dropdown work).
+// existing ones. DROP_INDEX/ADD_CONSTRAINT/RENAME_TABLE/PARTITION_TABLE
+// don't show a column field at all (unchanged from before this dropdown
+// work, now joined by the two operations that don't act on a single
+// column at all).
 export function needsExistingColumn(operation: Operation): boolean {
-  return operation !== "ADD_COLUMN" && operation !== "DROP_INDEX" && operation !== "ADD_CONSTRAINT";
+  return (
+    operation !== "ADD_COLUMN" &&
+    operation !== "DROP_INDEX" &&
+    operation !== "ADD_CONSTRAINT" &&
+    operation !== "RENAME_TABLE" &&
+    operation !== "PARTITION_TABLE" &&
+    operation !== "ADD_GENERATED_COLUMN"
+  );
 }
 
 function strategyTone(strategy: string): "petrol" | "amber" | "neutral" {
@@ -247,6 +356,18 @@ export default function NewMigration() {
     form.schema && form.table ? () => api.getTableStats(form.schema, form.table) : null,
     [form.schema, form.table],
   );
+  // ADD_FOREIGN_KEY's own "Referenced column" dropdown needs the
+  // REFERENCED table's columns (not the source table's, already covered
+  // by columnsQuery above) — fetched only once a referenced table has
+  // actually been chosen. Same-schema only for now: strategy.
+  // ColumnChange has no ReferencedSchema field yet (only
+  // ReferencedTable/ReferencedColumn), so a cross-schema reference isn't
+  // something this form can express even if the dropdown offered it —
+  // see the Referenced table dropdown's own comment on this.
+  const referencedColumnsQuery = useAsyncFetch<ColumnInfo[]>(
+    form.schema && form.referenced_table ? () => api.listColumns(form.schema, form.referenced_table) : null,
+    [form.schema, form.referenced_table],
+  );
   // Fetched once (no dependency array inputs change it) — this is
   // static, compile-time-known domain knowledge, not per-table data.
   // See StrategyMatrix's own doc comment for why the strategy override
@@ -383,54 +504,70 @@ export default function NewMigration() {
         <p className="text-sm text-ink-500">The exact SQL and any risks are shown live as you fill this in.</p>
       </div>
 
+      {/* Read-only — deliberately not an editable connection form. Every
+          migration always targets the single database this server was
+          started with (PGARCHIMIGRATOR_DATABASE_URL); this banner exists
+          purely so the operator can double-check which one that is
+          before submitting. Full-width and placed right under the page
+          title (rather than tucked inside the form card below) so it's
+          the first thing anyone sees before they start filling anything
+          in — a person switching between several pgArchiMigrator
+          instances shouldn't have to scroll into the form to confirm
+          which database they're about to touch. */}
+      {connectionQuery.data && (
+        <Card>
+          <CardBody className="flex flex-wrap items-center gap-x-8 gap-y-3">
+            <DatabaseIcon className="h-8 w-8 shrink-0 text-petrol-600" aria-hidden="true" />
+            <div>
+              <p className="text-xs font-bold text-ink-700">Hostname/IP</p>
+              <p className="font-mono text-sm text-ink-600">{connectionQuery.data.Host}</p>
+            </div>
+            <div>
+              <p className="text-xs font-bold text-ink-700">Port</p>
+              <p className="font-mono text-sm text-ink-600">{connectionQuery.data.Port}</p>
+            </div>
+            <div>
+              <p className="text-xs font-bold text-ink-700">Username</p>
+              <p className="font-mono text-sm text-ink-600">{connectionQuery.data.Username}</p>
+            </div>
+            <div>
+              <p className="text-xs font-bold text-ink-700">Database Name</p>
+              <p className="font-mono text-sm text-ink-600">{connectionQuery.data.Database}</p>
+            </div>
+            <div>
+              <p className="text-xs font-bold text-ink-700">Database Engine/Version</p>
+              {connectionQuery.data.PostgresVersion > 0 ? (
+                <p className="flex items-center gap-2 font-mono text-sm text-ink-600">
+                  <span title={connectionQuery.data.PostgresVersionString}>
+                    PostgreSQL {connectionQuery.data.PostgresVersion}
+                  </span>
+                  {/* below_minimum can't actually happen here in
+                      practice — the server refuses to even start
+                      serving requests against an unsupported version
+                      (see internal/orchestrator's VersionCheck) — but
+                      the badge is still handled defensively rather
+                      than assumed impossible, matching this
+                      component's general "don't assume, render what
+                      the API actually says" approach elsewhere. */}
+                  {connectionQuery.data.VersionSupportStatus === "below_minimum" && (
+                    <Badge tone="coral">unsupported version</Badge>
+                  )}
+                  {connectionQuery.data.VersionSupportStatus === "newer_than_tested" && (
+                    <Badge tone="amber">newer than tested</Badge>
+                  )}
+                </p>
+              ) : (
+                <p className="text-sm text-ink-400">—</p>
+              )}
+            </div>
+          </CardBody>
+        </Card>
+      )}
+
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2 lg:items-start">
         <Card>
           <CardBody>
             <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-              {/* Read-only — deliberately not an editable connection form.
-                  Every migration always targets the single database this
-                  server was started with (PGARCHIMIGRATOR_DATABASE_URL); this
-                  banner exists purely so the operator can double-check
-                  which one that is before submitting. */}
-              {connectionQuery.data && (
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md bg-ink-50 px-3 py-2 text-xs text-ink-500">
-                  <span className="font-medium text-ink-600">Connected to</span>
-                  <span className="font-mono text-ink-700">
-                    {connectionQuery.data.Host}:{connectionQuery.data.Port}
-                  </span>
-                  <span aria-hidden="true">·</span>
-                  <span className="font-mono text-ink-700">{connectionQuery.data.Database}</span>
-                  <span aria-hidden="true">·</span>
-                  <span>
-                    as <span className="font-mono text-ink-700">{connectionQuery.data.Username}</span>
-                  </span>
-                  {connectionQuery.data.PostgresVersion > 0 && (
-                    <>
-                      <span aria-hidden="true">·</span>
-                      <span
-                        className="font-mono text-ink-700"
-                        title={connectionQuery.data.PostgresVersionString}
-                      >
-                        PostgreSQL {connectionQuery.data.PostgresVersion}
-                      </span>
-                      {/* below_minimum can't actually happen here in
-                          practice — the server refuses to even start
-                          serving requests against an unsupported version
-                          (see internal/orchestrator's VersionCheck) — but
-                          the badge is still handled defensively rather
-                          than assumed impossible, matching this
-                          component's general "don't assume, render what
-                          the API actually says" approach elsewhere. */}
-                      {connectionQuery.data.VersionSupportStatus === "below_minimum" && (
-                        <Badge tone="coral">unsupported version</Badge>
-                      )}
-                      {connectionQuery.data.VersionSupportStatus === "newer_than_tested" && (
-                        <Badge tone="amber">newer than tested</Badge>
-                      )}
-                    </>
-                  )}
-                </div>
-              )}
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <label className="flex flex-col gap-1.5">
                   <span className="text-sm font-medium text-ink-700">Schema</span>
@@ -511,15 +648,19 @@ export default function NewMigration() {
                   onChange={(e) => handleOperationChange(e.target.value as Operation)}
                   className={selectClasses}
                 >
-                  {OPERATIONS.map((op) => (
-                    <option key={op} value={op}>
-                      {op}
-                    </option>
+                  {OPERATION_GROUPS.map((group) => (
+                    <optgroup key={group.label} label={group.label}>
+                      {group.operations.map((op) => (
+                        <option key={op} value={op} className={group.colorClass}>
+                          {op}
+                        </option>
+                      ))}
+                    </optgroup>
                   ))}
                 </select>
               </label>
 
-              {form.operation === "ADD_COLUMN" && (
+              {(form.operation === "ADD_COLUMN" || form.operation === "ADD_GENERATED_COLUMN") && (
                 <TextField
                   id="field-column"
                   label="Column"
@@ -532,7 +673,11 @@ export default function NewMigration() {
               {columnDropdownNeeded && (
                 <label className="flex flex-col gap-1.5">
                   <span className="text-sm font-medium text-ink-700">
-                    {form.operation === "RENAME_COLUMN" ? "Current column name" : "Column"}
+                    {form.operation === "RENAME_COLUMN"
+                      ? "Current column name"
+                      : form.operation === "ADD_FOREIGN_KEY"
+                        ? "Local column"
+                        : "Column"}
                   </span>
                   <select
                     value={form.column}
@@ -570,11 +715,13 @@ export default function NewMigration() {
                 />
               )}
 
-              {(form.operation === "ADD_COLUMN" || form.operation === "ALTER_COLUMN_TYPE") && (
+              {(form.operation === "ADD_COLUMN" ||
+                form.operation === "ALTER_COLUMN_TYPE" ||
+                form.operation === "ADD_GENERATED_COLUMN") && (
                 <TextField
                   label="Type"
                   placeholder="e.g. text, integer, varchar(100)"
-                  required={form.operation === "ALTER_COLUMN_TYPE"}
+                  required={form.operation === "ALTER_COLUMN_TYPE" || form.operation === "ADD_GENERATED_COLUMN"}
                   value={form.type}
                   onChange={(e) => update("type", e.target.value)}
                 />
@@ -627,6 +774,214 @@ export default function NewMigration() {
                   value={form.check_expression}
                   onChange={(e) => update("check_expression", e.target.value)}
                 />
+              )}
+
+              {form.operation === "RENAME_TABLE" && (
+                <TextField
+                  label="New table name"
+                  required
+                  value={form.new_table_name}
+                  onChange={(e) => update("new_table_name", e.target.value)}
+                />
+              )}
+
+              {form.operation === "ADD_FOREIGN_KEY" && (
+                <>
+                  <TextField
+                    label="Constraint name"
+                    required
+                    value={form.constraint_name}
+                    onChange={(e) => update("constraint_name", e.target.value)}
+                  />
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-sm font-medium text-ink-700">Referenced table</span>
+                    <select
+                      value={form.referenced_table}
+                      onChange={(e) => {
+                        update("referenced_table", e.target.value);
+                        // A different referenced table invalidates any
+                        // previously chosen referenced column — same
+                        // "changing the parent resets the dependent
+                        // field" pattern the schema/table selects above
+                        // already use.
+                        update("referenced_column", "");
+                      }}
+                      disabled={tablesQuery.loading || !form.schema}
+                      aria-busy={tablesQuery.loading}
+                      required
+                      className={selectClasses}
+                    >
+                      <option value="">{tablesQuery.loading ? "Loading…" : "(choose a table)"}</option>
+                      {/* Same schema only — see referencedColumnsQuery's
+                          own comment on why a cross-schema reference
+                          isn't something this form can express yet.
+                          Excludes the source table itself: not because a
+                          self-referencing foreign key is invalid in
+                          PostgreSQL (it genuinely isn't — a manager_id
+                          column referencing the same table's own id is
+                          a completely ordinary pattern), but because
+                          this dropdown's own primary job is picking a
+                          DIFFERENT, already-existing table to point at,
+                          and offering the source table back to itself
+                          here invites picking it by mistake. */}
+                      {tablesQuery.data
+                        ?.filter((t) => t !== form.table)
+                        .map((t) => (
+                          <option key={t} value={t}>
+                            {t}
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-sm font-medium text-ink-700">Referenced column</span>
+                    <select
+                      value={form.referenced_column}
+                      onChange={(e) => update("referenced_column", e.target.value)}
+                      disabled={referencedColumnsQuery.loading || !form.referenced_table}
+                      aria-busy={referencedColumnsQuery.loading}
+                      required
+                      className={selectClasses}
+                    >
+                      <option value="">
+                        {referencedColumnsQuery.loading
+                          ? "Loading…"
+                          : form.referenced_table
+                            ? "(choose a column)"
+                            : "(choose a table first)"}
+                      </option>
+                      {/* Every column is a technically legal target for
+                          a foreign key in PostgreSQL as long as it has a
+                          UNIQUE or PRIMARY KEY constraint — this list
+                          intentionally still offers every column rather
+                          than pre-filtering to just those (the metadata
+                          this dropdown has access to doesn't currently
+                          distinguish "has some unique constraint" from
+                          "doesn't"), but primary keys — overwhelmingly
+                          the common, correct choice — are marked so
+                          they're easy to spot at a glance. */}
+                      {referencedColumnsQuery.data?.map((c) => (
+                        <option key={c.Name} value={c.Name} className={c.IsPrimaryKey ? "text-petrol-700" : undefined}>
+                          {c.Name}
+                          {c.IsPrimaryKey ? " — primary key" : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {referencedColumnsQuery.error && (
+                    <RetryableError
+                      message={referencedColumnsQuery.error}
+                      onRetry={referencedColumnsQuery.retry}
+                      label="referenced table's columns"
+                    />
+                  )}
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-sm font-medium text-ink-700">On delete</span>
+                    <select
+                      value={form.on_delete}
+                      onChange={(e) => update("on_delete", e.target.value)}
+                      className={selectClasses}
+                    >
+                      <option value="">(default — NO ACTION)</option>
+                      <option value="CASCADE">CASCADE</option>
+                      <option value="SET NULL">SET NULL</option>
+                      <option value="SET DEFAULT">SET DEFAULT</option>
+                      <option value="RESTRICT">RESTRICT</option>
+                      <option value="NO ACTION">NO ACTION</option>
+                    </select>
+                  </label>
+                </>
+              )}
+
+              {form.operation === "ADD_GENERATED_COLUMN" && (
+                <TextField
+                  label="Generated expression"
+                  placeholder="e.g. price * quantity"
+                  required
+                  value={form.generated_expression}
+                  onChange={(e) => update("generated_expression", e.target.value)}
+                />
+              )}
+
+              {form.operation === "PARTITION_TABLE" && (
+                <>
+                  <TextField
+                    label="Partition column"
+                    required
+                    value={form.partition_column}
+                    onChange={(e) => update("partition_column", e.target.value)}
+                  />
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-sm font-medium text-ink-700">Partition strategy</span>
+                    <select
+                      value={form.partition_strategy}
+                      onChange={(e) => update("partition_strategy", e.target.value)}
+                      className={selectClasses}
+                    >
+                      <option value="">(choose one)</option>
+                      <option value="RANGE">RANGE</option>
+                      <option value="LIST">LIST</option>
+                    </select>
+                  </label>
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-sm font-medium text-ink-700">Partition bounds (JSON)</span>
+                    <textarea
+                      placeholder={
+                        form.partition_strategy === "LIST"
+                          ? '[{"name":"orders_eu","values":["DE","FR"]},{"name":"orders_us","values":["US"]}]'
+                          : '[{"name":"orders_2024_01","from":"2024-01-01","to":"2024-02-01"}] — or use the interval shortcut below'
+                      }
+                      value={form.partition_bounds_raw}
+                      onChange={(e) => update("partition_bounds_raw", e.target.value)}
+                      rows={3}
+                      className="resize-y rounded-md border border-ink-200 px-3 py-2 font-mono text-xs text-ink-800 placeholder:text-ink-300 focus:outline-none focus:ring-2 focus:ring-petrol-500 focus:border-petrol-500"
+                    />
+                    <span className="text-xs text-ink-400">
+                      Required for LIST partitioning. For RANGE, an alternative to the interval shortcut below.
+                    </span>
+                  </label>
+                  {form.partition_strategy === "RANGE" && (
+                    <div className="flex flex-col gap-1.5 rounded-md border border-ink-100 bg-ink-50 p-3">
+                      <span className="text-xs font-medium uppercase tracking-wide text-ink-400">
+                        Or generate bounds from a rule (RANGE only)
+                      </span>
+                      <label className="flex flex-col gap-1.5">
+                        <span className="text-sm font-medium text-ink-700">Interval</span>
+                        <select
+                          value={form.partition_interval}
+                          onChange={(e) => update("partition_interval", e.target.value)}
+                          className={selectClasses}
+                        >
+                          <option value="">(none — use the JSON bounds above)</option>
+                          <option value="daily">daily</option>
+                          <option value="monthly">monthly</option>
+                          <option value="yearly">yearly</option>
+                        </select>
+                      </label>
+                      <TextField
+                        label="From"
+                        placeholder="YYYY-MM-DD"
+                        value={form.partition_rule_from}
+                        onChange={(e) => update("partition_rule_from", e.target.value)}
+                      />
+                      <TextField
+                        label="To"
+                        placeholder="YYYY-MM-DD"
+                        value={form.partition_rule_to}
+                        onChange={(e) => update("partition_rule_to", e.target.value)}
+                      />
+                    </div>
+                  )}
+                  <label className="flex items-center gap-2 text-sm text-ink-700">
+                    <input
+                      type="checkbox"
+                      checked={form.partition_include_default}
+                      onChange={(e) => update("partition_include_default", e.target.checked)}
+                      className="rounded border-ink-300 text-petrol-600 focus:ring-petrol-500"
+                    />
+                    Add a DEFAULT partition (recommended unless your bounds are certainly exhaustive)
+                  </label>
+                </>
               )}
 
               <label className="flex flex-col gap-1.5">

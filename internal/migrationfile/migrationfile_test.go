@@ -1,9 +1,12 @@
 package migrationfile
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/pgarchihub/pgarchimigrator/internal/strategy"
 )
 
 func TestValidate_RequiresID(t *testing.T) {
@@ -36,7 +39,10 @@ func TestValidate_AcceptsAMinimalValidMigration(t *testing.T) {
 
 func TestToMigrationRequest_DefaultsSchemaToPublic(t *testing.T) {
 	m := MigrationFile{ID: "001", Table: "orders", Operation: "ADD_COLUMN", Column: "status"}
-	req := m.ToMigrationRequest("test-actor")
+	req, err := m.ToMigrationRequest("test-actor")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if req.SchemaName != "public" {
 		t.Errorf("expected SchemaName to default to \"public\", got %q", req.SchemaName)
 	}
@@ -44,7 +50,10 @@ func TestToMigrationRequest_DefaultsSchemaToPublic(t *testing.T) {
 
 func TestToMigrationRequest_RespectsExplicitSchema(t *testing.T) {
 	m := MigrationFile{ID: "001", Schema: "billing", Table: "orders", Operation: "ADD_COLUMN"}
-	req := m.ToMigrationRequest("test-actor")
+	req, err := m.ToMigrationRequest("test-actor")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if req.SchemaName != "billing" {
 		t.Errorf("expected SchemaName=\"billing\", got %q", req.SchemaName)
 	}
@@ -58,7 +67,10 @@ func TestToMigrationRequest_RespectsExplicitSchema(t *testing.T) {
 // decide whether this migration has already run.
 func TestToMigrationRequest_UsesIDAsJobName(t *testing.T) {
 	m := MigrationFile{ID: "20260826_add_status_column", Table: "orders", Operation: "ADD_COLUMN"}
-	req := m.ToMigrationRequest("test-actor")
+	req, err := m.ToMigrationRequest("test-actor")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if req.Name != "20260826_add_status_column" {
 		t.Errorf("expected the job Name to be the migration's ID, got %q", req.Name)
 	}
@@ -71,7 +83,10 @@ func TestToMigrationRequest_CopiesEveryField(t *testing.T) {
 		VolatileDefault: true, IndexName: "idx_test", ConstraintName: "check_amount",
 		CheckExpression: "amount > 0", NewColumnName: "new_amount", StrategyOverride: "DIRECT_DDL",
 	}
-	req := m.ToMigrationRequest("test-actor")
+	req, err := m.ToMigrationRequest("test-actor")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	checks := []struct {
 		name, want, got string
@@ -209,5 +224,74 @@ func TestLoadDir_PropagatesAParseErrorFromAnyFile(t *testing.T) {
 
 	if _, err := LoadDir(dir); err == nil {
 		t.Error("expected LoadDir to propagate the parse error from the broken file")
+	}
+}
+
+func TestToMigrationRequest_PartitionTable_ExplicitBounds_EncodedCorrectly(t *testing.T) {
+	m := MigrationFile{
+		ID: "001", Table: "orders", Operation: "PARTITION_TABLE",
+		PartitionColumn: "region", PartitionStrategy: "LIST",
+		PartitionBounds: []strategy.PartitionBound{{Name: "orders_eu", Values: []string{"DE", "FR"}}},
+	}
+	req, err := m.ToMigrationRequest("test-actor")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var decoded []strategy.PartitionBound
+	if err := json.Unmarshal([]byte(req.Change.PartitionBoundsJSON), &decoded); err != nil {
+		t.Fatalf("PartitionBoundsJSON did not round-trip as valid JSON: %v", err)
+	}
+	if len(decoded) != 1 || decoded[0].Name != "orders_eu" {
+		t.Errorf("expected the explicit bounds to be preserved, got %+v", decoded)
+	}
+}
+
+// TestToMigrationRequest_PartitionTable_RuleBasedShortcut_ExpandsCorrectly
+// is the direct regression test for the rule-based convenience path
+// working through Migration as Code too, not just the API/CLI.
+func TestToMigrationRequest_PartitionTable_RuleBasedShortcut_ExpandsCorrectly(t *testing.T) {
+	m := MigrationFile{
+		ID: "001", Table: "orders", Operation: "PARTITION_TABLE",
+		PartitionColumn: "created_at", PartitionStrategy: "RANGE",
+		PartitionInterval: "monthly", PartitionRuleFrom: "2024-01-01", PartitionRuleTo: "2024-04-01",
+	}
+	req, err := m.ToMigrationRequest("test-actor")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var decoded []strategy.PartitionBound
+	if err := json.Unmarshal([]byte(req.Change.PartitionBoundsJSON), &decoded); err != nil {
+		t.Fatalf("PartitionBoundsJSON did not round-trip as valid JSON: %v", err)
+	}
+	if len(decoded) != 3 {
+		t.Fatalf("expected 3 monthly partitions from the rule, got %d", len(decoded))
+	}
+}
+
+// TestToMigrationRequest_PartitionTable_ListWithNoExplicitBounds_ReturnsError
+// is the direct regression test for the real reason ToMigrationRequest's
+// signature had to change: unlike every other operation, PARTITION_TABLE
+// can genuinely fail here (an invalid rule, or LIST with nothing to
+// expand into), and that failure must surface as a real error, not be
+// silently swallowed.
+func TestToMigrationRequest_PartitionTable_ListWithNoExplicitBounds_ReturnsError(t *testing.T) {
+	m := MigrationFile{
+		ID: "001", Table: "orders", Operation: "PARTITION_TABLE",
+		PartitionColumn: "region", PartitionStrategy: "LIST",
+		// No PartitionBounds, and LIST has no rule-based shortcut.
+	}
+	if _, err := m.ToMigrationRequest("test-actor"); err == nil {
+		t.Error("expected an error for LIST partitioning with no explicit bounds")
+	}
+}
+
+func TestToMigrationRequest_PartitionTable_InvalidRule_ReturnsError(t *testing.T) {
+	m := MigrationFile{
+		ID: "001", Table: "orders", Operation: "PARTITION_TABLE",
+		PartitionColumn: "created_at", PartitionStrategy: "RANGE",
+		PartitionInterval: "weekly", PartitionRuleFrom: "2024-01-01", PartitionRuleTo: "2024-04-01",
+	}
+	if _, err := m.ToMigrationRequest("test-actor"); err == nil {
+		t.Error("expected an error for an invalid partition rule interval")
 	}
 }

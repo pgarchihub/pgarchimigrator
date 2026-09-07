@@ -4,12 +4,16 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
 	"os/user"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,15 +26,20 @@ import (
 	"github.com/pgarchihub/pgarchimigrator/internal/config"
 	"github.com/pgarchihub/pgarchimigrator/internal/db"
 	"github.com/pgarchihub/pgarchimigrator/internal/ddlflow"
+	"github.com/pgarchihub/pgarchimigrator/internal/ecosystem"
+	"github.com/pgarchihub/pgarchimigrator/internal/entitlement"
+	"github.com/pgarchihub/pgarchimigrator/internal/idempotency"
 	"github.com/pgarchihub/pgarchimigrator/internal/migrationfile"
 	"github.com/pgarchihub/pgarchimigrator/internal/orchestrator"
 	"github.com/pgarchihub/pgarchimigrator/internal/preview"
 	"github.com/pgarchihub/pgarchimigrator/internal/progress"
 	"github.com/pgarchihub/pgarchimigrator/internal/reaper"
+	"github.com/pgarchihub/pgarchimigrator/internal/serviceauth"
 	"github.com/pgarchihub/pgarchimigrator/internal/shadowflow"
 	"github.com/pgarchihub/pgarchimigrator/internal/state"
 	"github.com/pgarchihub/pgarchimigrator/internal/strategy"
 	"github.com/pgarchihub/pgarchimigrator/internal/typecompat"
+	"github.com/pgarchihub/pgarchimigrator/internal/upgrade"
 	"github.com/pgarchihub/pgarchimigrator/internal/version"
 )
 
@@ -55,6 +64,8 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newListCmd())
 	root.AddCommand(newSweepCmd())
 	root.AddCommand(newAuthCmd())
+	root.AddCommand(newEcosystemCmd())
+	root.AddCommand(newUpgradeCmd())
 	root.AddCommand(newServeCmd()) // REST API (FR-09/FR-10, for the dashboard)
 	root.AddCommand(newVersionCmd())
 
@@ -67,6 +78,21 @@ func newVersionCmd() *cobra.Command {
 		Short: "Print the pgarchimigrator version",
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Println(version.Version)
+			// Same PGARCHIMIGRATOR_EDITION resolution every other edition
+			// check in this codebase uses (see entitlement.NewConfigChecker's
+			// own doc comment) — this command never hardcodes "Community",
+			// so a genuinely Enterprise-configured build reports its own
+			// real edition here too, not a copy-pasted label.
+			edition := entitlement.NewConfigChecker(os.Getenv("PGARCHIMIGRATOR_EDITION")).Edition()
+			// Capitalizes "community"/"enterprise" for display — done
+			// manually rather than via the now-deprecated strings.Title,
+			// which exists purely to avoid a linter warning for a
+			// one-line job on a fixed, ASCII-only set of values.
+			editionStr := string(edition)
+			if editionStr != "" {
+				editionStr = strings.ToUpper(editionStr[:1]) + editionStr[1:]
+			}
+			fmt.Printf("Edition: %s\n", editionStr)
 		},
 	}
 }
@@ -81,6 +107,13 @@ type wiring struct {
 	auditWriter *auditlog.FileWriter
 	orch        *orchestrator.Orchestrator
 	connInfo    db.ConnectionInfo
+	// entitlement is exposed here (not just consumed internally) so a
+	// future internal/api wiring point — e.g. a dashboard badge showing
+	// which edition is running — can read it without needing its own,
+	// separate PGARCHIMIGRATOR_EDITION lookup. Not yet consumed
+	// anywhere outside this file; see docs/ecosystem/ARCHITECTURE.md
+	// for the full rollout plan.
+	entitlement entitlement.Checker
 }
 
 func (w *wiring) Close() {
@@ -152,12 +185,42 @@ func buildWiring(ctx context.Context, stateDBPath string) (*wiring, error) {
 	preflighter := db.NewPgxPreflighter(pool)
 	replicationDSN := shadowflow.ReplicationDSN(dsn)
 
+	// Ecosystem integration — see docs/ecosystem/ARCHITECTURE.md for the
+	// full design. Both are opt-in and default to "off"/"community"
+	// specifically so upgrading to a build that includes this layer
+	// never silently changes an existing deployment's behavior: no
+	// events are published unless PGARCHIMIGRATOR_ECOSYSTEM_EVENTS_ENABLED
+	// is explicitly set to "true".
+	entitlementChecker := entitlement.NewConfigChecker(os.Getenv("PGARCHIMIGRATOR_EDITION"))
+
+	// effectiveStore is what every flow/orchestrator below actually
+	// receives — either the plain SQLite store, or that same store
+	// wrapped with ecosystem.Store when event publishing is enabled.
+	// Deliberately kept as the state.Store INTERFACE (not the concrete
+	// *state.SQLiteStore type wiring.store holds for its own Close()
+	// call below) — ddlflow/shadowflow/orchestrator only ever depend on
+	// the interface, so this substitution is invisible to all three.
+	var effectiveStore state.Store = store
+	if os.Getenv("PGARCHIMIGRATOR_ECOSYSTEM_EVENTS_ENABLED") == "true" {
+		instanceID := os.Getenv("PGARCHIMIGRATOR_INSTANCE_ID")
+		if instanceID == "" {
+			if hostname, err := os.Hostname(); err == nil {
+				instanceID = hostname
+			}
+		}
+		// LogPublisher today — see its own doc comment for why this is
+		// a genuinely working integration for a self-hosted operator,
+		// not a placeholder, even before a real message-broker/webhook
+		// Publisher exists.
+		effectiveStore = ecosystem.NewStore(store, ecosystem.LogPublisher{}, entitlementChecker, instanceID, version.Version)
+	}
+
 	flowFor := func(strat strategy.Strategy) (orchestrator.Flow, error) {
 		switch strat {
 		case strategy.StrategyDirectDDL, strategy.StrategyExpandBackfill:
-			return ddlflow.New(pool, store), nil
+			return ddlflow.New(pool, effectiveStore), nil
 		case strategy.StrategyShadowTable:
-			return shadowflow.New(pool, replicationDSN, store, preflighter), nil
+			return shadowflow.New(pool, replicationDSN, effectiveStore, preflighter), nil
 		default:
 			return nil, fmt.Errorf("no flow registered for strategy %s", strat)
 		}
@@ -176,7 +239,7 @@ func buildWiring(ctx context.Context, stateDBPath string) (*wiring, error) {
 		}, nil
 	}
 
-	orch := orchestrator.New(store, flowFor, tableStats)
+	orch := orchestrator.New(effectiveStore, flowFor, tableStats)
 	if auditWriter != nil {
 		orch.AuditWriter = auditWriter
 	}
@@ -190,6 +253,7 @@ func buildWiring(ctx context.Context, stateDBPath string) (*wiring, error) {
 		auditWriter: auditWriter,
 		orch:        orch,
 		connInfo:    connInfo,
+		entitlement: entitlementChecker,
 	}, nil
 }
 
@@ -209,20 +273,32 @@ func currentActor() string {
 
 func newMigrateCmd() *cobra.Command {
 	var (
-		stateDBPath      string
-		schemaName       string
-		tableName        string
-		columnName       string
-		operationStr     string
-		columnType       string
-		defaultValue     string
-		isVolatile       bool
-		strategyOverride string
-		indexName        string
-		constraintName   string
-		checkExpression  string
-		newColumnName    string
-		dryRun           bool
+		stateDBPath             string
+		schemaName              string
+		tableName               string
+		columnName              string
+		operationStr            string
+		columnType              string
+		defaultValue            string
+		isVolatile              bool
+		strategyOverride        string
+		indexName               string
+		constraintName          string
+		checkExpression         string
+		newColumnName           string
+		newTableName            string
+		referencedTable         string
+		referencedColumn        string
+		onDelete                string
+		generatedExpr           string
+		partitionColumn         string
+		partitionStrategy       string
+		partitionBoundsRaw      string
+		partitionIncludeDefault bool
+		partitionInterval       string
+		partitionRuleFrom       string
+		partitionRuleTo         string
+		dryRun                  bool
 	)
 
 	cmd := &cobra.Command{
@@ -230,6 +306,12 @@ func newMigrateCmd() *cobra.Command {
 		Short: "Start a schema-change migration (FR-01..FR-04)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			op := strategy.Operation(operationStr)
+
+			// Populated inside the PARTITION_TABLE case below (either
+			// directly from --partition-bounds, or expanded from a rule)
+			// — declared here so it's in scope when the final
+			// strategy.ColumnChange gets built further down.
+			var partitionBoundsJSON string
 
 			// --column, --index-name, and --constraint-name/--check-expression
 			// are each required for some operations but not others, which
@@ -263,6 +345,67 @@ func newMigrateCmd() *cobra.Command {
 				if newColumnName == "" {
 					return fmt.Errorf("--new-column-name is required for RENAME_COLUMN")
 				}
+			case strategy.OpRenameTable:
+				// Deliberately does NOT fall into the default case's
+				// "--column is required" check below — the one
+				// operation here that acts on the table itself, not any
+				// particular column.
+				if newTableName == "" {
+					return fmt.Errorf("--new-table-name is required for RENAME_TABLE")
+				}
+			case strategy.OpAddForeignKey:
+				if columnName == "" {
+					return fmt.Errorf("--column (the local column) is required for ADD_FOREIGN_KEY")
+				}
+				if constraintName == "" {
+					return fmt.Errorf("--constraint-name is required for ADD_FOREIGN_KEY")
+				}
+				if referencedTable == "" || referencedColumn == "" {
+					return fmt.Errorf("--referenced-table and --referenced-column are both required for ADD_FOREIGN_KEY")
+				}
+			case strategy.OpAddGeneratedColumn:
+				if columnName == "" {
+					return fmt.Errorf("--column is required for ADD_GENERATED_COLUMN")
+				}
+				if columnType == "" {
+					return fmt.Errorf("--type is required for ADD_GENERATED_COLUMN")
+				}
+				if generatedExpr == "" {
+					return fmt.Errorf("--generated-expression is required for ADD_GENERATED_COLUMN")
+				}
+			case strategy.OpPartitionTable:
+				if partitionColumn == "" {
+					return fmt.Errorf("--partition-column is required for PARTITION_TABLE")
+				}
+				if err := strategy.ValidatePartitionStrategy(partitionStrategy); err != nil {
+					return err
+				}
+
+				var bounds []strategy.PartitionBound
+				if partitionBoundsRaw != "" {
+					if err := json.Unmarshal([]byte(partitionBoundsRaw), &bounds); err != nil {
+						return fmt.Errorf("--partition-bounds is not valid JSON: %w", err)
+					}
+				}
+				if len(bounds) == 0 {
+					if partitionStrategy != "RANGE" {
+						return fmt.Errorf("--partition-bounds is required for LIST partitioning (no rule-based shortcut exists for it)")
+					}
+					if partitionInterval == "" || partitionRuleFrom == "" || partitionRuleTo == "" {
+						return fmt.Errorf("either --partition-bounds, or all of --partition-interval/--partition-rule-from/--partition-rule-to, is required for PARTITION_TABLE")
+					}
+					expanded, err := strategy.ExpandPartitionRule(partitionInterval, partitionRuleFrom, partitionRuleTo, tableName)
+					if err != nil {
+						return err
+					}
+					bounds = expanded
+				}
+
+				boundsJSON, err := json.Marshal(bounds)
+				if err != nil {
+					return fmt.Errorf("failed to encode partition bounds: %w", err)
+				}
+				partitionBoundsJSON = string(boundsJSON)
 			default: // ADD_COLUMN, DROP_COLUMN, ALTER_COLUMN_TYPE
 				if columnName == "" {
 					return fmt.Errorf("--column is required for %s", op)
@@ -304,6 +447,15 @@ func newMigrateCmd() *cobra.Command {
 					ConstraintName:           constraintName,
 					CheckExpression:          checkExpression,
 					NewColumnName:            newColumnName,
+					NewTableName:             newTableName,
+					ReferencedTable:          referencedTable,
+					ReferencedColumn:         referencedColumn,
+					OnDelete:                 onDelete,
+					GeneratedExpression:      generatedExpr,
+					PartitionColumn:          partitionColumn,
+					PartitionStrategy:        partitionStrategy,
+					PartitionBoundsJSON:      partitionBoundsJSON,
+					PartitionIncludeDefault:  partitionIncludeDefault,
 					TypeConversionCompatible: typeCompatible,
 				},
 				StrategyOverride: strategy.Strategy(strategyOverride),
@@ -333,16 +485,28 @@ func newMigrateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&stateDBPath, "state-db", config.Default().StateDBPath, "path to the SQLite state database")
 	cmd.Flags().StringVar(&schemaName, "schema", "public", "target schema name")
 	cmd.Flags().StringVar(&tableName, "table", "", "target table name (required)")
-	cmd.Flags().StringVar(&columnName, "column", "", "target column name (required for ADD_COLUMN, DROP_COLUMN, ALTER_COLUMN_TYPE, ADD_INDEX, SET_NOT_NULL, RENAME_COLUMN — the existing name for RENAME_COLUMN)")
-	cmd.Flags().StringVar(&operationStr, "operation", "", "ADD_COLUMN, DROP_COLUMN, ALTER_COLUMN_TYPE, ADD_INDEX, DROP_INDEX, SET_NOT_NULL, ADD_CONSTRAINT, or RENAME_COLUMN (required)")
+	cmd.Flags().StringVar(&columnName, "column", "", "target column name (required for ADD_COLUMN, DROP_COLUMN, ALTER_COLUMN_TYPE, ADD_INDEX, SET_NOT_NULL, RENAME_COLUMN, ADD_FOREIGN_KEY, ADD_GENERATED_COLUMN — the existing name for RENAME_COLUMN, the local column for ADD_FOREIGN_KEY, the new column's name for ADD_GENERATED_COLUMN)")
+	cmd.Flags().StringVar(&operationStr, "operation", "", "ADD_COLUMN, DROP_COLUMN, ALTER_COLUMN_TYPE, ADD_INDEX, DROP_INDEX, SET_NOT_NULL, ADD_CONSTRAINT, RENAME_COLUMN, RENAME_TABLE, ADD_FOREIGN_KEY, ADD_GENERATED_COLUMN, or PARTITION_TABLE (required)")
 	cmd.Flags().StringVar(&columnType, "type", "", "new column type (required for ALTER_COLUMN_TYPE, or the type of the column being added)")
 	cmd.Flags().StringVar(&defaultValue, "default", "", "default value expression for ADD_COLUMN (e.g. \"'active'\" or \"now()\")")
 	cmd.Flags().BoolVar(&isVolatile, "volatile-default", false, "set if --default is a volatile expression (e.g. now()), triggering Expand & Backfill")
 	cmd.Flags().StringVar(&strategyOverride, "strategy", "", "override the automatic strategy decision (DIRECT_DDL, EXPAND_BACKFILL, SHADOW_TABLE)")
 	cmd.Flags().StringVar(&indexName, "index-name", "", "index name for ADD_INDEX (optional, auto-generated as idx_<table>_<column> if omitted) or DROP_INDEX (required)")
-	cmd.Flags().StringVar(&constraintName, "constraint-name", "", "constraint name for SET_NOT_NULL (optional, auto-generated if omitted) or ADD_CONSTRAINT (required)")
+	cmd.Flags().StringVar(&constraintName, "constraint-name", "", "constraint name for SET_NOT_NULL (optional, auto-generated if omitted), ADD_CONSTRAINT (required), or ADD_FOREIGN_KEY (required)")
 	cmd.Flags().StringVar(&checkExpression, "check-expression", "", "CHECK(...) expression body for ADD_CONSTRAINT, e.g. \"price > 0\" (required)")
 	cmd.Flags().StringVar(&newColumnName, "new-column-name", "", "the new name for RENAME_COLUMN (required) — see the command's long help for why this doesn't do a plain ALTER TABLE RENAME")
+	cmd.Flags().StringVar(&newTableName, "new-table-name", "", "the new name for RENAME_TABLE (required) — like RENAME_COLUMN, leaves a compatibility view under the old name rather than an instant, breaking rename")
+	cmd.Flags().StringVar(&referencedTable, "referenced-table", "", "the table the foreign key references, in the same schema (required for ADD_FOREIGN_KEY)")
+	cmd.Flags().StringVar(&referencedColumn, "referenced-column", "", "the column the foreign key references — usually a primary key (required for ADD_FOREIGN_KEY)")
+	cmd.Flags().StringVar(&onDelete, "on-delete", "", "ON DELETE action for ADD_FOREIGN_KEY: CASCADE, SET NULL, SET DEFAULT, RESTRICT, or NO ACTION (optional — defaults to PostgreSQL's own NO ACTION)")
+	cmd.Flags().StringVar(&generatedExpr, "generated-expression", "", "the expression for ADD_GENERATED_COLUMN, e.g. \"price * quantity\" (required) — a real native GENERATED column on a small table, or a trigger-kept-in-sync plain column on a large one; see the command's long help")
+	cmd.Flags().StringVar(&partitionColumn, "partition-column", "", "the column to partition by (required for PARTITION_TABLE)")
+	cmd.Flags().StringVar(&partitionStrategy, "partition-strategy", "", "RANGE or LIST (required for PARTITION_TABLE)")
+	cmd.Flags().StringVar(&partitionBoundsRaw, "partition-bounds", "", `explicit partition bounds as JSON, e.g. '[{"name":"orders_eu","values":["DE","FR"]}]' for LIST or '[{"name":"orders_2024_01","from":"2024-01-01","to":"2024-02-01"}]' for RANGE — required for LIST; for RANGE, an alternative to --partition-interval/--partition-rule-from/--partition-rule-to`)
+	cmd.Flags().BoolVar(&partitionIncludeDefault, "partition-include-default", false, "add a DEFAULT partition catching any row outside the explicit bounds (recommended unless your bounds are certainly exhaustive)")
+	cmd.Flags().StringVar(&partitionInterval, "partition-interval", "", "RANGE only: daily, monthly, or yearly — generates evenly-spaced partitions between --partition-rule-from and --partition-rule-to instead of listing them out via --partition-bounds")
+	cmd.Flags().StringVar(&partitionRuleFrom, "partition-rule-from", "", "RANGE rule-based shortcut: start date (YYYY-MM-DD), used with --partition-interval")
+	cmd.Flags().StringVar(&partitionRuleTo, "partition-rule-to", "", "RANGE rule-based shortcut: end date (YYYY-MM-DD), used with --partition-interval")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview the strategy, the SQL that would run, and any pre-flight warnings — makes no changes")
 	_ = cmd.MarkFlagRequired("table")
 	_ = cmd.MarkFlagRequired("operation")
@@ -412,7 +576,10 @@ files.`,
 				}
 				fmt.Println()
 
-				req := m.ToMigrationRequest(currentActor())
+				req, err := m.ToMigrationRequest(currentActor())
+				if err != nil {
+					return fmt.Errorf("migration %q: %w", m.ID, err)
+				}
 				job, err := w.orch.StartMigration(cmd.Context(), req)
 				if job != nil {
 					fmt.Print(progress.Compute(job).Render())
@@ -477,7 +644,11 @@ func newPreviewFileCmd() *cobra.Command {
 				}
 				fmt.Println(" ===")
 
-				req := m.ToMigrationRequest(currentActor())
+				req, err := m.ToMigrationRequest(currentActor())
+				if err != nil {
+					fmt.Printf("PREVIEW FAILED: %v\n\n", err)
+					continue
+				}
 				report, err := preview.Generate(cmd.Context(), w.pool, w.orch.TableStats, req)
 				if err != nil {
 					// Unlike apply-file, a preview failure for one
@@ -684,6 +855,7 @@ func newServeCmd() *cobra.Command {
 	var (
 		stateDBPath   string
 		authDBPath    string
+		upgradeDBPath string
 		addr          string
 		autoSweep     bool
 		secureCookies bool
@@ -705,6 +877,64 @@ func newServeCmd() *cobra.Command {
 			}
 			defer authStore.Close()
 			authService := auth.NewService(authStore)
+
+			// Service-to-service (OAuth2 client-credentials) auth for
+			// ecosystem callers — see docs/ecosystem/ARCHITECTURE.md.
+			// Deliberately shares authDBPath with the human-auth store
+			// just above rather than needing its own --serviceauth-db
+			// flag: internal/serviceauth's own SQLiteStore doc comment
+			// notes this is a fine wiring-level choice (SQLite has no
+			// objection to multiple unrelated table sets in one file),
+			// and it's one fewer path for an operator to configure.
+			serviceAuthStore, err := serviceauth.NewSQLiteStore(authDBPath)
+			if err != nil {
+				return fmt.Errorf("failed to open the service-auth database (%s): %w", authDBPath, err)
+			}
+			defer serviceAuthStore.Close()
+			serviceAuthService := serviceauth.NewService(serviceAuthStore)
+
+			// PostgreSQL major-version upgrade (see
+			// docs/ecosystem/ARCHITECTURE.md's own "PostgreSQL
+			// major-version upgrade" section) — its own separate
+			// SQLite file, same "isolate this write path" reasoning
+			// as internal/upgrade.SQLiteStore's own doc comment.
+			// StaticConnectionProvider is today's only
+			// ConnectionProvider — see that type's own doc comment for
+			// why Enterprise/Cloud can later swap in a dynamic one
+			// without any handler code changing.
+			upgradeStore, err := upgrade.NewSQLiteStore(upgradeDBPath)
+			if err != nil {
+				return fmt.Errorf("failed to open the upgrade database (%s): %w", upgradeDBPath, err)
+			}
+			defer upgradeStore.Close()
+
+			// Same opt-in ecosystem-events wrapping buildWiring already
+			// applies to the migration store (effectiveStore) — see
+			// that function's own comment on PGARCHIMIGRATOR_ECOSYSTEM_EVENTS_ENABLED.
+			// w.entitlement is buildWiring's own already-constructed
+			// entitlement.Checker (see wiring's own doc comment on that
+			// field), reused here rather than building a second one, so
+			// the migration store and the upgrade store always agree on
+			// which edition this instance is running as.
+			var effectiveUpgradeStore upgrade.Store = upgradeStore
+			if os.Getenv("PGARCHIMIGRATOR_ECOSYSTEM_EVENTS_ENABLED") == "true" {
+				instanceID := os.Getenv("PGARCHIMIGRATOR_INSTANCE_ID")
+				if instanceID == "" {
+					if hostname, err := os.Hostname(); err == nil {
+						instanceID = hostname
+					}
+				}
+				effectiveUpgradeStore = ecosystem.NewUpgradeStore(upgradeStore, ecosystem.LogPublisher{}, w.entitlement, instanceID, version.Version)
+			}
+
+			// Idempotency-Key support (AC-PF-003 §12.2/AOL-STD-API-001
+			// §5.5) — same "shares authDBPath, one fewer path to
+			// configure" reasoning as serviceAuthStore just above.
+			idempotencyStore, err := idempotency.NewSQLiteStore(authDBPath)
+			if err != nil {
+				return fmt.Errorf("failed to open the idempotency database (%s): %w", authDBPath, err)
+			}
+			defer idempotencyStore.Close()
 
 			r := reaper.New(w.store, w.pool)
 
@@ -728,7 +958,7 @@ func newServeCmd() *cobra.Command {
 				fmt.Fprintln(os.Stderr, "warning: --secure-cookies is false — session cookies will be sent over plain HTTP. Set --secure-cookies=true once this is served behind HTTPS (TR-05).")
 			}
 
-			server := api.NewServer(w.orch, w.store, r, authService, secureCookies, w.pool, w.connInfo)
+			server := api.NewServer(w.orch, w.store, r, authService, serviceAuthService, effectiveUpgradeStore, upgrade.StaticConnectionProvider{}, idempotencyStore, secureCookies, w.pool, w.connInfo)
 			httpServer := &http.Server{Addr: addr, Handler: server}
 
 			fmt.Printf("pgarchimigrator %s\n", version.Version)
@@ -760,6 +990,7 @@ func newServeCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&stateDBPath, "state-db", config.Default().StateDBPath, "path to the SQLite state database")
 	cmd.Flags().StringVar(&authDBPath, "auth-db", config.Default().AuthDBPath, "path to the SQLite auth database (users, sessions)")
+	cmd.Flags().StringVar(&upgradeDBPath, "upgrade-db", config.Default().UpgradeDBPath, "path to the SQLite upgrade-progress database")
 	cmd.Flags().StringVar(&addr, "addr", ":8080", "address to listen on")
 	cmd.Flags().BoolVar(&autoSweep, "auto-sweep", true, "run internal/reaper's periodic sweep loop in the background while serving")
 	cmd.Flags().BoolVar(&secureCookies, "secure-cookies", false, "mark the session cookie Secure (set true once served behind HTTPS)")
@@ -829,5 +1060,316 @@ func newCreateAdminCmd() *cobra.Command {
 	cmd.Flags().StringVar(&email, "email", "", "admin email (required)")
 	cmd.Flags().StringVar(&password, "password", "", "admin password, at least 8 characters (required)")
 	cmd.Flags().StringVar(&orgName, "org", "Default Organization", "organization display name (only used on first bootstrap)")
+	return cmd
+}
+
+// newEcosystemCmd groups commands for the Archi ecosystem integration
+// layer (see docs/ecosystem/ARCHITECTURE.md) — today, just registering
+// the service clients (e.g. one ArchiConsole deployment) allowed to
+// call this product's API via OAuth2 client-credentials.
+func newEcosystemCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "ecosystem",
+		Short: "Manage Archi ecosystem integration (service clients for OAuth2 client-credentials auth)",
+	}
+	cmd.AddCommand(newCreateClientCmd())
+	cmd.AddCommand(newListClientsCmd())
+	return cmd
+}
+
+// newCreateClientCmd registers a new service client. Unlike
+// `auth create-admin`'s --password (a value the operator chooses),
+// the client secret here is always GENERATED — see
+// serviceauth.GenerateClientSecret's own doc comment for why a
+// machine-to-machine credential should be high-entropy and
+// machine-generated, never human-chosen — and is printed to stdout
+// exactly once, since serviceauth.Client only ever persists its hash
+// (Client.ClientSecretHash's own doc comment: "shown ... exactly once
+// ... never persisted or retrievable again"). If it's lost, the only
+// recovery is deleting and re-creating the client.
+func newCreateClientCmd() *cobra.Command {
+	var (
+		authDBPath string
+		name       string
+		scopesRaw  string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "create-client",
+		Short: "Register a new service client (e.g. an ArchiConsole deployment) for OAuth2 client-credentials auth",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if name == "" {
+				return fmt.Errorf("--name is required")
+			}
+			var scopes []string
+			for _, s := range strings.Split(scopesRaw, ",") {
+				if s = strings.TrimSpace(s); s != "" {
+					scopes = append(scopes, s)
+				}
+			}
+			if len(scopes) == 0 {
+				return fmt.Errorf("--scopes is required (comma-separated, e.g. pgarchimigrator.read,pgarchimigrator.migrate)")
+			}
+
+			store, err := serviceauth.NewSQLiteStore(authDBPath)
+			if err != nil {
+				return fmt.Errorf("failed to open the service-auth database (%s): %w", authDBPath, err)
+			}
+			defer store.Close()
+
+			rawSecret, secretHash, err := serviceauth.GenerateClientSecret()
+			if err != nil {
+				return fmt.Errorf("failed to generate a client secret: %w", err)
+			}
+
+			clientID := "client_" + randomHex(8)
+			client := &serviceauth.Client{
+				Name: name, ClientID: clientID, ClientSecretHash: secretHash, Scopes: scopes,
+			}
+			if err := store.CreateClient(cmd.Context(), client); err != nil {
+				if errors.Is(err, serviceauth.ErrDuplicateClientID) {
+					return fmt.Errorf("a client with this client_id already exists (this should be extremely rare — try again)")
+				}
+				return fmt.Errorf("failed to create client: %w", err)
+			}
+
+			fmt.Printf("Client registered: %s\n", client.Name)
+			fmt.Printf("  client_id:     %s\n", client.ClientID)
+			fmt.Printf("  client_secret: %s\n", rawSecret)
+			fmt.Printf("  scopes:        %s\n", strings.Join(client.Scopes, ", "))
+			fmt.Println()
+			fmt.Println("Save the client_secret now — it is shown only this once and cannot be retrieved again.")
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&authDBPath, "auth-db", config.Default().AuthDBPath, "path to the SQLite auth database")
+	cmd.Flags().StringVar(&name, "name", "", "a human-readable name for this client, e.g. \"ArchiConsole (production)\" (required)")
+	cmd.Flags().StringVar(&scopesRaw, "scopes", "", "comma-separated scopes this client may request, e.g. pgarchimigrator.read,pgarchimigrator.migrate (required)")
+	return cmd
+}
+
+func newListClientsCmd() *cobra.Command {
+	var authDBPath string
+
+	cmd := &cobra.Command{
+		Use:   "list-clients",
+		Short: "List registered service clients",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := serviceauth.NewSQLiteStore(authDBPath)
+			if err != nil {
+				return fmt.Errorf("failed to open the service-auth database (%s): %w", authDBPath, err)
+			}
+			defer store.Close()
+
+			clients, err := store.ListClients(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("failed to list clients: %w", err)
+			}
+			if len(clients) == 0 {
+				fmt.Println("No service clients registered.")
+				return nil
+			}
+			for _, c := range clients {
+				fmt.Printf("%-24s %-30s %s\n", c.ClientID, c.Name, strings.Join(c.Scopes, ","))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&authDBPath, "auth-db", config.Default().AuthDBPath, "path to the SQLite auth database")
+	return cmd
+}
+
+// randomHex returns n random bytes, hex-encoded — used for a client_id
+// (a PUBLIC identifier, unlike the client secret, so it doesn't need
+// serviceauth.GenerateClientSecret's full 256 bits; this is deliberately
+// smaller, matching how job IDs and other non-secret identifiers
+// elsewhere in this project are sized).
+func randomHex(n int) string {
+	buf := make([]byte, n)
+	_, _ = rand.Read(buf)
+	return hex.EncodeToString(buf)
+}
+
+// newUpgradeCmd groups commands for internal/upgrade — PostgreSQL
+// major-version upgrades (see docs/ecosystem/ARCHITECTURE.md's own
+// "PostgreSQL major-version upgrade" section for the full design).
+// Deliberately its own top-level command, not folded under an existing
+// one — an upgrade job is conceptually unrelated to a single-table
+// migration job (see internal/upgrade's own package doc comment for why
+// it's a parallel package rather than a new operation type), so it gets
+// its own parallel command tree rather than living under `migrate` or
+// sharing flags/state with it.
+func newUpgradeCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "upgrade",
+		Short: "Sync an entire database from an old PostgreSQL instance to a new one (major-version upgrade)",
+	}
+	cmd.AddCommand(newUpgradeStartCmd())
+	cmd.AddCommand(newUpgradeStatusCmd())
+	cmd.AddCommand(newUpgradeListCmd())
+	return cmd
+}
+
+func newUpgradeStartCmd() *cobra.Command {
+	var (
+		upgradeDBPath        string
+		sourceDSN            string
+		targetDSN            string
+		sourceReplicationDSN string
+		schemasRaw           string
+		tablesRaw            string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "start",
+		Short: "Start a database upgrade — introspects, syncs, and validates every in-scope table, then stops (no cutover)",
+		Long: "Runs synchronously in the foreground, like apply-file — for a genuinely long-running\n" +
+			"upgrade, run this under your own process supervisor (systemd, nohup, tmux) rather\n" +
+			"than expecting this command itself to detach. Use `upgrade status` from another\n" +
+			"terminal to follow progress while this runs.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if sourceDSN == "" || targetDSN == "" {
+				return fmt.Errorf("--source-dsn and --target-dsn are both required")
+			}
+
+			var schemas []string
+			for _, s := range strings.Split(schemasRaw, ",") {
+				if s = strings.TrimSpace(s); s != "" {
+					schemas = append(schemas, s)
+				}
+			}
+
+			// --tables takes precedence over --schemas — see
+			// upgrade.Job.Tables' own doc comment for why the two are
+			// mutually exclusive (table-level scoping vs whole-schema
+			// scoping), matching the dashboard's own checkbox picker
+			// sending exactly one or the other, never both.
+			var tables []upgrade.TableRef
+			for _, t := range strings.Split(tablesRaw, ",") {
+				t = strings.TrimSpace(t)
+				if t == "" {
+					continue
+				}
+				schema, table, found := strings.Cut(t, ".")
+				if !found {
+					return fmt.Errorf("--tables entries must be schema.table (got %q)", t)
+				}
+				tables = append(tables, upgrade.TableRef{SchemaName: schema, TableName: table})
+			}
+
+			store, err := upgrade.NewSQLiteStore(upgradeDBPath)
+			if err != nil {
+				return fmt.Errorf("failed to open the upgrade database (%s): %w", upgradeDBPath, err)
+			}
+			defer store.Close()
+
+			job := &upgrade.Job{
+				Schemas:              schemas,
+				SourceConnectionRef:  sourceDSN,
+				TargetConnectionRef:  targetDSN,
+				SourceReplicationRef: sourceReplicationDSN,
+				Tables:               tables,
+			}
+			if err := store.CreateJob(cmd.Context(), job); err != nil {
+				return fmt.Errorf("failed to create upgrade job: %w", err)
+			}
+			fmt.Printf("Upgrade job created: %s\n", job.ID)
+			fmt.Println("Introspecting source, creating target schema, syncing, and validating — this can take a long time for a large database.")
+			fmt.Printf("Run `pgarchimigrator upgrade status %s` from another terminal to follow progress.\n\n", job.ID)
+
+			flow := &upgrade.Flow{Store: store, ConnectionProvider: upgrade.StaticConnectionProvider{}}
+			if err := flow.Run(cmd.Context(), job); err != nil {
+				return fmt.Errorf("upgrade failed (phase: %s): %w", job.Phase, err)
+			}
+
+			fmt.Printf("\nUpgrade ready: %d/%d tables synced and verified.\n", job.TablesVerified, job.TablesTotal)
+			fmt.Println("This tool does not perform cutover — repointing application traffic at the new instance is a separate, deliberate step.")
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&upgradeDBPath, "upgrade-db", config.Default().UpgradeDBPath, "path to the SQLite upgrade-progress database")
+	cmd.Flags().StringVar(&sourceDSN, "source-dsn", "", "connection string for the OLD-version source instance (required)")
+	cmd.Flags().StringVar(&targetDSN, "target-dsn", "", "connection string for the NEW-version target instance, already running and reachable (required)")
+	cmd.Flags().StringVar(&sourceReplicationDSN, "source-replication-dsn", "",
+		"connection string the TARGET instance's own PostgreSQL server should use to reach the source for replication — only needed when it differs "+
+			"from --source-dsn (e.g. this command reaches source via a host-mapped Docker port like localhost:55432, but the target container must "+
+			"reach it via the Docker network's own hostname like pg-logical:5432). Defaults to --source-dsn if not set.")
+	cmd.Flags().StringVar(&schemasRaw, "schemas", "", "comma-separated schemas to include (default: every schema on the source instance)")
+	cmd.Flags().StringVar(&tablesRaw, "tables", "", "comma-separated schema.table pairs for table-level scoping — takes precedence over --schemas when set")
+	return cmd
+}
+
+func newUpgradeStatusCmd() *cobra.Command {
+	var upgradeDBPath string
+
+	cmd := &cobra.Command{
+		Use:   "status <job-id>",
+		Short: "Show an upgrade job's current phase and per-table progress",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := upgrade.NewSQLiteStore(upgradeDBPath)
+			if err != nil {
+				return fmt.Errorf("failed to open the upgrade database (%s): %w", upgradeDBPath, err)
+			}
+			defer store.Close()
+
+			job, err := store.GetJob(cmd.Context(), args[0])
+			if err != nil {
+				return fmt.Errorf("failed to look up upgrade job %s: %w", args[0], err)
+			}
+			fmt.Printf("Job %s — phase: %s\n", job.ID, job.Phase)
+			if job.LastError != "" {
+				fmt.Printf("  last error: %s\n", job.LastError)
+			}
+			fmt.Printf("  tables: %d total, %d synced, %d verified\n", job.TablesTotal, job.TablesSynced, job.TablesVerified)
+
+			tables, err := store.ListTables(cmd.Context(), job.ID)
+			if err != nil {
+				return fmt.Errorf("failed to list tables for job %s: %w", job.ID, err)
+			}
+			for _, t := range tables {
+				line := fmt.Sprintf("  %s.%s: %s", t.SchemaName, t.TableName, t.Phase)
+				if t.LastError != "" {
+					line += " (" + t.LastError + ")"
+				}
+				fmt.Println(line)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&upgradeDBPath, "upgrade-db", config.Default().UpgradeDBPath, "path to the SQLite upgrade-progress database")
+	return cmd
+}
+
+func newUpgradeListCmd() *cobra.Command {
+	var upgradeDBPath string
+
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List upgrade jobs",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := upgrade.NewSQLiteStore(upgradeDBPath)
+			if err != nil {
+				return fmt.Errorf("failed to open the upgrade database (%s): %w", upgradeDBPath, err)
+			}
+			defer store.Close()
+
+			jobs, err := store.ListJobs(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("failed to list upgrade jobs: %w", err)
+			}
+			if len(jobs) == 0 {
+				fmt.Println("No upgrade jobs found.")
+				return nil
+			}
+			for _, j := range jobs {
+				fmt.Printf("%-28s %-16s %d/%d tables verified\n", j.ID, j.Phase, j.TablesVerified, j.TablesTotal)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&upgradeDBPath, "upgrade-db", config.Default().UpgradeDBPath, "path to the SQLite upgrade-progress database")
 	return cmd
 }

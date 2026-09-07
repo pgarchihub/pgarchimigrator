@@ -107,19 +107,33 @@ jobs:
         # own comment on this variable.
         run: docker compose -f deploy/docker-compose.dev.yml up -d
 
-      - name: Wait for pg-logical to accept connections
+      - name: Wait for pg-logical and pg-upgrade-target to accept connections
+        # pg-upgrade-target (deploy/docker-compose.dev.yml) is
+        # internal/upgrade's own second, separate PostgreSQL instance —
+        # its own integration tests need it just as much as pg-logical,
+        # so it needs the same readiness gate pg-logical already had,
+        # not just an implicit "docker compose up finished starting
+        # containers" assumption (a container existing and PostgreSQL
+        # inside it actually accepting connections are different
+        # points in time).
         run: |
-          for i in $(seq 1 30); do
-            if docker compose -f deploy/docker-compose.dev.yml exec -T pg-logical pg_isready -U pgarchimigrator > /dev/null 2>&1; then
-              echo "pg-logical is ready"
-              exit 0
+          for svc in pg-logical pg-upgrade-target; do
+            ready=false
+            for i in $(seq 1 30); do
+              if docker compose -f deploy/docker-compose.dev.yml exec -T "$svc" pg_isready -U pgarchimigrator > /dev/null 2>&1; then
+                echo "$svc is ready"
+                ready=true
+                break
+              fi
+              echo "waiting for $svc... ($i/30)"
+              sleep 2
+            done
+            if [ "$ready" != true ]; then
+              echo "$svc did not become ready in time" >&2
+              docker compose -f deploy/docker-compose.dev.yml logs "$svc"
+              exit 1
             fi
-            echo "waiting for pg-logical... ($i/30)"
-            sleep 2
           done
-          echo "pg-logical did not become ready in time" >&2
-          docker compose -f deploy/docker-compose.dev.yml logs pg-logical
-          exit 1
 
       - name: go test (integration)
         # -p 1 forces packages to run ONE AT A TIME, not Go's default
@@ -207,3 +221,27 @@ jobs:
 
       - name: helm template (sanity-check manifest rendering)
         run: helm template ci-check deploy/helm/pgarchimigrator > /dev/null
+
+      - name: install.sh syntax check
+        # Can't run this end to end in CI — it needs a real GitHub
+        # Release to download from, which doesn't exist until this
+        # project's first tag is actually pushed — so this is limited
+        # to catching a syntax error before it reaches anyone piping
+        # this script straight into their shell (see the script's own
+        # header comment for the security reasoning behind everything
+        # it actually does at runtime).
+        run: sh -n scripts/install.sh
+
+      - name: install.ps1 syntax check
+        # GitHub's own ubuntu-latest runner ships PowerShell Core
+        # (pwsh) preinstalled — Parser.ParseFile validates syntax
+        # without executing anything, the PowerShell equivalent of
+        # `sh -n` above.
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("scripts/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }

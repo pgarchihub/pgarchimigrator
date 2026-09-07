@@ -28,7 +28,7 @@ import Setup from "./Setup";
 function renderSetup() {
   return render(
     <AuthProvider>
-      <MemoryRouter initialEntries={["/setup"]} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <MemoryRouter initialEntries={["/setup"]}>
         <Setup />
       </MemoryRouter>
     </AuthProvider>,

@@ -1,0 +1,30 @@
+{
+  "$comment": "AOL-STD-DEPLOY-001 Section 6's own recommended identity block, extended with the fields that section's own MUST list requires. This is a DIFFERENT manifest from internal/api/ecosystemmanifest/archi-product-manifest.yaml (that one is the AC-PF-003 capability/API/event contract — GET /api/v1/manifest serves it at runtime). This file is deployment/packaging metadata specifically: what AOL-STD-DEPLOY-001 Section 16's own repository-deliverables layout expects at deploy/manifests/pgarchimigrator.json. The two manifests describe the same product from two different standards with overlapping but not identical field sets; kept as two files rather than merged so each stays a faithful, minimal implementation of the standard it actually answers to.",
+  "metadata": {
+    "productId": "pgarchimigrator",
+    "displayName": "pgArchiMigrator",
+    "productVersion": "2.0.0",
+    "manifestVersion": "2.0.0",
+    "compatibilityAliases": ["pgarchimigration"]
+  },
+  "lifecycleDomains": ["migration"],
+  "compatibility": {
+    "archiConsole": {
+      "minVersion": "0.1.0"
+    },
+    "postgresql": {
+      "minVersion": 12,
+      "maxVersion": 18
+    }
+  },
+  "auth": {
+    "methods": ["oauth2-client-credentials"],
+    "scopes": ["pgarchimigrator.read", "pgarchimigrator.migrate"]
+  },
+  "releaseChannel": "internal",
+  "installationProfiles": ["desktop-managed-local"],
+  "upgradeSource": {
+    "fromVersion": "1.0.0"
+  },
+  "sourceRepository": "https://github.com/pgarchihub/pgarchimigrator"
+}

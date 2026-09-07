@@ -3,7 +3,8 @@
 // the shadow-table / WAL flow; see internal/shadowflow for that.
 //
 // Supported operations: ADD_COLUMN, DROP_COLUMN, ADD_INDEX, DROP_INDEX,
-// SET_NOT_NULL, ADD_CONSTRAINT, RENAME_COLUMN.
+// SET_NOT_NULL, ADD_CONSTRAINT, RENAME_COLUMN, RENAME_TABLE, ADD_FOREIGN_KEY,
+// ADD_GENERATED_COLUMN.
 package ddlflow
 
 import (
@@ -93,8 +94,14 @@ func (f *DDLFlow) Execute(ctx context.Context, job *state.Job) error {
 		return f.executeAddConstraint(ctx, job)
 	case "RENAME_COLUMN":
 		return f.executeRenameColumn(ctx, job)
+	case "RENAME_TABLE":
+		return f.executeRenameTable(ctx, job)
+	case "ADD_FOREIGN_KEY":
+		return f.executeAddForeignKey(ctx, job)
+	case "ADD_GENERATED_COLUMN":
+		return f.executeAddGeneratedColumn(ctx, job)
 	default:
-		return fmt.Errorf("ddlflow: unsupported operation: %s (supported: ADD_COLUMN, DROP_COLUMN, ADD_INDEX, DROP_INDEX, SET_NOT_NULL, ADD_CONSTRAINT, RENAME_COLUMN)", job.Operation)
+		return fmt.Errorf("ddlflow: unsupported operation: %s (supported: ADD_COLUMN, DROP_COLUMN, ADD_INDEX, DROP_INDEX, SET_NOT_NULL, ADD_CONSTRAINT, RENAME_COLUMN, RENAME_TABLE, ADD_FOREIGN_KEY, ADD_GENERATED_COLUMN)", job.Operation)
 	}
 }
 
@@ -624,9 +631,333 @@ func (f *DDLFlow) executeAddConstraint(ctx context.Context, job *state.Job) erro
 	return f.setPhase(ctx, job, state.PhaseCompleted)
 }
 
-// executeRenameColumn implements RENAME_COLUMN via a real expand &
-// contract pattern, NOT a plain ALTER TABLE ... RENAME COLUMN. That
-// statement is metadata-only and instant at the database level, but it
+// executeAddForeignKey implements ADD_FOREIGN_KEY using the same NOT
+// VALID + VALIDATE CONSTRAINT pattern as executeAddConstraint just
+// above — PostgreSQL supports this for foreign keys too, not just CHECK
+// constraints: adding the constraint NOT VALID is instant/metadata-only
+// (PostgreSQL trusts the caller and doesn't scan existing rows), and the
+// separate VALIDATE CONSTRAINT scan takes only a SHARE UPDATE EXCLUSIVE
+// lock — non-blocking for concurrent reads/writes, unlike the ACCESS
+// EXCLUSIVE lock a plain ADD CONSTRAINT would hold for its own
+// verification scan.
+//
+// Deliberately does NOT separately verify the referenced column has a
+// UNIQUE/PRIMARY KEY constraint (a real PostgreSQL requirement for any
+// FK target) — PostgreSQL enforces this natively and returns a clear,
+// specific error (SQLSTATE 42830, "there is no unique constraint
+// matching given keys") if it's missing, which f.fail below surfaces to
+// the caller unchanged. Reimplementing that check here would just be a
+// second, worse-explained place this could go wrong.
+func (f *DDLFlow) executeAddForeignKey(ctx context.Context, job *state.Job) error {
+	if job.ConstraintName == "" {
+		return f.fail(ctx, job, fmt.Errorf("ADD_FOREIGN_KEY requires a constraint name"))
+	}
+	if job.ColumnName == "" {
+		return f.fail(ctx, job, fmt.Errorf("ADD_FOREIGN_KEY requires the local column name"))
+	}
+	if job.ReferencedTable == "" || job.ReferencedColumn == "" {
+		return f.fail(ctx, job, fmt.Errorf("ADD_FOREIGN_KEY requires both a referenced table and a referenced column"))
+	}
+
+	if err := f.setPhase(ctx, job, state.PhasePreparation); err != nil {
+		return err
+	}
+
+	// Defense in depth — see strategy.ValidateOnDeleteAction's own doc
+	// comment. Unlike ColumnName/ConstraintName/ReferencedTable/
+	// ReferencedColumn (plain identifiers, safe via quoteIdent() alone
+	// — see quoteIdent's own doc comment), OnDelete is inlined as a
+	// literal keyword phrase, not an identifier, so it needs its own
+	// check the same way DefaultValue/CheckExpression do elsewhere in
+	// this file.
+	if err := strategy.ValidateOnDeleteAction(job.OnDelete); err != nil {
+		return f.fail(ctx, job, err)
+	}
+
+	// References the target as schema.table — assumed to be in the
+	// SAME schema as the table being modified (see
+	// strategy.ColumnChange.ReferencedTable's own doc comment for why a
+	// genuinely cross-schema target isn't supported via a dedicated
+	// field in this version).
+	referencedQualified := quoteIdent(job.SchemaName) + "." + quoteIdent(job.ReferencedTable)
+	addDDL := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
+		qualifiedTable(job), quoteIdent(job.ConstraintName), quoteIdent(job.ColumnName),
+		referencedQualified, quoteIdent(job.ReferencedColumn))
+	if job.OnDelete != "" {
+		// Validated above — safe to inline as a literal keyword phrase
+		// (not parameter-bindable in DDL, same as every other clause
+		// built in this file).
+		addDDL += " ON DELETE " + job.OnDelete
+	}
+	addDDL += " NOT VALID"
+
+	if err := execDDLWithLockTimeout(ctx, f.Pool, addDDL); err != nil {
+		return f.fail(ctx, job, fmt.Errorf("failed to add the (not yet validated) foreign key: %w", err))
+	}
+
+	if err := f.setPhase(ctx, job, state.PhaseValidating); err != nil {
+		return err
+	}
+
+	validateFKDDL := fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s", qualifiedTable(job), quoteIdent(job.ConstraintName))
+	if _, err := f.Pool.Exec(ctx, validateFKDDL); err != nil {
+		_, _ = f.Pool.Exec(ctx, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s", qualifiedTable(job), quoteIdent(job.ConstraintName)))
+		return f.fail(ctx, job, fmt.Errorf("foreign key validation failed (an existing row references a value that doesn't exist in %s): %w", job.ReferencedTable, err))
+	}
+
+	return f.setPhase(ctx, job, state.PhaseCompleted)
+}
+
+// generatedColumnSyncNames deterministically derives the sync trigger
+// function and trigger names from the job — same reasoning as
+// renameSyncNames: not persisted as separate state.Job fields, since
+// they can always be recomputed identically from job.ID at rollback
+// time.
+func generatedColumnSyncNames(job *state.Job) (fnName, trgName string) {
+	shortID := job.ID
+	if len(shortID) > 16 {
+		shortID = shortID[:16]
+	}
+	return "pgam_gencol_sync_fn_" + shortID, "pgam_gencol_sync_trg_" + shortID
+}
+
+// executeAddGeneratedColumn implements ADD_GENERATED_COLUMN via one of
+// two genuinely different mechanisms depending on job.Strategy (already
+// decided by strategy.Decide based on table size — see
+// strategy.OpAddGeneratedColumn's own doc comment for why there's no
+// single mechanism that works well at every size):
+//
+//   - DIRECT_DDL (small table): a real, native
+//     GENERATED ALWAYS AS (...) STORED column via a single ALTER TABLE.
+//     PostgreSQL's own mechanism, no caveats — the table rewrite it
+//     requires is cheap enough on a small table not to matter.
+//
+//   - EXPAND_BACKFILL (large table): PostgreSQL has no way to add a
+//     STORED generated column without computing every existing row's
+//     value up front (a full table rewrite regardless of table size),
+//     so a large table instead gets a PLAIN column kept in sync by a
+//     BEFORE INSERT/UPDATE trigger (see createGeneratedColumnSyncTrigger),
+//     with existing rows backfilled in batches. Behaviorally equivalent
+//     for reads (the column always reflects the expression), but NOT a
+//     true native GENERATED column: (1) the trigger silently
+//     RECOMPUTES the value on every write, rather than PostgreSQL's own
+//     behavior of REJECTING an INSERT/UPDATE that tries to explicitly
+//     set a value for a generated column; (2) it won't show up
+//     specially in \d+ output or participate in the handful of
+//     PostgreSQL features that specifically special-case generated
+//     columns (e.g. some logical replication publication behavior).
+//     This trade-off is the price of avoiding a blocking table rewrite
+//     on a large table — see this project's own trust-layer philosophy
+//     for why that trade is made explicitly, not silently.
+func (f *DDLFlow) executeAddGeneratedColumn(ctx context.Context, job *state.Job) error {
+	if err := f.setPhase(ctx, job, state.PhasePreparation); err != nil {
+		return err
+	}
+
+	if err := strategy.ValidateColumnType(job.ColumnType); err != nil {
+		return f.fail(ctx, job, err)
+	}
+	if job.GeneratedExpression == "" {
+		return f.fail(ctx, job, fmt.Errorf("ADD_GENERATED_COLUMN requires a generated expression"))
+	}
+	if err := strategy.ValidateSQLExpression(job.GeneratedExpression, "generated expression"); err != nil {
+		return f.fail(ctx, job, err)
+	}
+
+	if job.Strategy == "EXPAND_BACKFILL" {
+		return f.executeAddGeneratedColumnViaBackfill(ctx, job)
+	}
+	return f.executeAddGeneratedColumnDirect(ctx, job)
+}
+
+// executeAddGeneratedColumnDirect is the small-table path — see
+// executeAddGeneratedColumn's own doc comment.
+func (f *DDLFlow) executeAddGeneratedColumnDirect(ctx context.Context, job *state.Job) error {
+	ddl := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s GENERATED ALWAYS AS (%s) STORED",
+		qualifiedTable(job), quoteIdent(job.ColumnName), job.ColumnType, job.GeneratedExpression)
+	if err := execDDLWithLockTimeout(ctx, f.Pool, ddl); err != nil {
+		return f.fail(ctx, job, fmt.Errorf("failed to add the generated column: %w", err))
+	}
+	return f.setPhase(ctx, job, state.PhaseCompleted)
+}
+
+// createGeneratedColumnSyncTrigger sets up the trigger that makes a
+// plain column BEHAVE like a generated one for every write from this
+// point forward — see executeAddGeneratedColumn's own doc comment for
+// how this differs from a true native GENERATED column. Unconditionally
+// recomputes NEW.<column> on every INSERT/UPDATE, silently overriding
+// any value the statement tried to set explicitly — simpler than
+// createRenameSyncTrigger's bidirectional TG_OP branching, since there's
+// only one direction to sync here (the expression always wins).
+func (f *DDLFlow) createGeneratedColumnSyncTrigger(ctx context.Context, job *state.Job) error {
+	fnName, trgName := generatedColumnSyncNames(job)
+
+	// CREATE OR REPLACE + DROP TRIGGER IF EXISTS before CREATE TRIGGER —
+	// same retry-safety reasoning as createRenameSyncTrigger's identical
+	// pattern.
+	createFnDDL := fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $pgam$
+		BEGIN
+			NEW.%s := %s;
+			RETURN NEW;
+		END;
+		$pgam$ LANGUAGE plpgsql
+	`, quoteIdent(fnName), quoteIdent(job.ColumnName), job.GeneratedExpression)
+	if _, err := f.Pool.Exec(ctx, createFnDDL); err != nil {
+		return fmt.Errorf("failed to create sync trigger function: %w", err)
+	}
+
+	dropTrgDDL := fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s", quoteIdent(trgName), qualifiedTable(job))
+	if _, err := f.Pool.Exec(ctx, dropTrgDDL); err != nil {
+		return fmt.Errorf("failed to drop any leftover sync trigger before recreating: %w", err)
+	}
+
+	createTrgDDL := fmt.Sprintf("CREATE TRIGGER %s BEFORE INSERT OR UPDATE ON %s FOR EACH ROW EXECUTE FUNCTION %s()",
+		quoteIdent(trgName), qualifiedTable(job), quoteIdent(fnName))
+	if _, err := f.Pool.Exec(ctx, createTrgDDL); err != nil {
+		return fmt.Errorf("failed to create sync trigger: %w", err)
+	}
+	return nil
+}
+
+// executeAddGeneratedColumnViaBackfill is the large-table path — see
+// executeAddGeneratedColumn's own doc comment.
+func (f *DDLFlow) executeAddGeneratedColumnViaBackfill(ctx context.Context, job *state.Job) error {
+	addDDL := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s",
+		qualifiedTable(job), quoteIdent(job.ColumnName), job.ColumnType)
+	if err := execDDLWithLockTimeout(ctx, f.Pool, addDDL); err != nil {
+		return f.fail(ctx, job, fmt.Errorf("failed to add column: %w", err))
+	}
+
+	if err := f.createGeneratedColumnSyncTrigger(ctx, job); err != nil {
+		return f.fail(ctx, job, err)
+	}
+
+	// See createBackfillIndex's doc comment for why this temporary index
+	// exists at all — without it, the backfill loop below degrades badly
+	// at scale (a real, load-test-found issue).
+	indexName := backfillIndexName(job)
+	whereClause := quoteIdent(job.ColumnName) + " IS NULL"
+	if err := f.createBackfillIndex(ctx, job, indexName, job.ColumnName, whereClause); err != nil {
+		return f.fail(ctx, job, fmt.Errorf("failed to create backfill index: %w", err))
+	}
+	defer f.dropBackfillIndexBestEffort(job.SchemaName, indexName)
+
+	if err := f.setPhase(ctx, job, state.PhaseSyncing); err != nil {
+		return err
+	}
+	if err := f.generatedColumnBackfillLoop(ctx, job); err != nil {
+		return f.fail(ctx, job, err)
+	}
+
+	if err := f.setPhase(ctx, job, state.PhaseValidating); err != nil {
+		return err
+	}
+	remaining, err := f.countRemainingNulls(ctx, job)
+	if err != nil {
+		return f.fail(ctx, job, fmt.Errorf("validation query failed: %w", err))
+	}
+	if remaining > 0 {
+		return f.fail(ctx, job, fmt.Errorf("backfill incomplete: %d row(s) still NULL", remaining))
+	}
+
+	return f.setPhase(ctx, job, state.PhaseCompleted)
+}
+
+// generatedColumnBackfillLoop mirrors backfillLoop/runBackfillBatch
+// (ADD_COLUMN's volatile-default path) but computes job.GeneratedExpression
+// instead of applying a fixed default expression — cannot reuse
+// runBackfillBatch directly since that function hardcodes job.DefaultValue
+// as the value being backfilled.
+func (f *DDLFlow) generatedColumnBackfillLoop(ctx context.Context, job *state.Job) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if f.Watcher != nil {
+			if waiting, err := f.Watcher.CheckLockWait(ctx); err == nil && waiting {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(lockWaitBackoff):
+				}
+				continue
+			}
+		}
+
+		rowsAffected, err := f.runGeneratedColumnBackfillBatch(ctx, job)
+		if err != nil {
+			return fmt.Errorf("backfill batch failed: %w", err)
+		}
+		if rowsAffected == 0 {
+			return nil
+		}
+		if err := f.Store.IncrementRowsProcessed(ctx, job.ID, rowsAffected); err != nil {
+			log.Printf("ddlflow: failed to persist rows-processed counter for job %s: %v", job.ID, err)
+		}
+		job.RowsProcessed += rowsAffected
+	}
+}
+
+func (f *DDLFlow) runGeneratedColumnBackfillBatch(ctx context.Context, job *state.Job) (int64, error) {
+	batchSQL := fmt.Sprintf(`
+		UPDATE %s SET %s = %s
+		WHERE ctid = ANY(ARRAY(
+			SELECT ctid FROM %s WHERE %s IS NULL LIMIT %d
+		))
+	`,
+		qualifiedTable(job), quoteIdent(job.ColumnName), job.GeneratedExpression,
+		qualifiedTable(job), quoteIdent(job.ColumnName), f.batchSize(),
+	)
+	tag, err := f.Pool.Exec(ctx, batchSQL)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// rollbackAddGeneratedColumn reverses ADD_GENERATED_COLUMN by dropping
+// the sync trigger/function (harmless no-op via IF EXISTS if the DIRECT
+// path was used instead, which never created them) and the column
+// itself.
+//
+// SAFETY GUARD: like rollbackAddColumn, this refuses to act on a
+// COMPLETED job — a generated column holds real, computed data an
+// application may already be reading, same reasoning as a plain
+// ADD_COLUMN. Unlike RENAME_COLUMN's rollback (always safe, since the
+// OLD column is untouched and only additive infrastructure gets
+// removed), there's no fallback column here — dropping this one removes
+// the only place this data exists.
+func (f *DDLFlow) rollbackAddGeneratedColumn(ctx context.Context, job *state.Job) error {
+	if job.Phase == state.PhaseCompleted {
+		return fmt.Errorf("ddlflow: refusing to roll back a COMPLETED ADD_GENERATED_COLUMN migration — " +
+			"application code may already be reading this column; " +
+			"this must be handled as a new, explicit migration (DROP_COLUMN), not a rollback")
+	}
+
+	fnName, trgName := generatedColumnSyncNames(job)
+	dropTrgDDL := fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s", quoteIdent(trgName), qualifiedTable(job))
+	if _, err := f.Pool.Exec(ctx, dropTrgDDL); err != nil {
+		return fmt.Errorf("rollback (drop sync trigger) failed: %w", err)
+	}
+	dropFnDDL := fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", quoteIdent(fnName))
+	if _, err := f.Pool.Exec(ctx, dropFnDDL); err != nil {
+		return fmt.Errorf("rollback (drop sync function) failed: %w", err)
+	}
+
+	if job.ColumnName != "" {
+		dropColDDL := fmt.Sprintf("ALTER TABLE %s DROP COLUMN IF EXISTS %s", qualifiedTable(job), quoteIdent(job.ColumnName))
+		if _, err := f.Pool.Exec(ctx, dropColDDL); err != nil {
+			return fmt.Errorf("rollback (drop column) failed: %w", err)
+		}
+	}
+
+	return f.setPhase(ctx, job, state.PhaseAborted)
+}
+
 // breaks any application code still using the old name THE MOMENT it
 // runs — the downtime just moves from the database to every caller that
 // hasn't been redeployed yet, which defeats the point of this whole tool.
@@ -703,6 +1034,55 @@ func (f *DDLFlow) executeRenameColumn(ctx context.Context, job *state.Job) error
 	}
 	if remaining > 0 {
 		return f.fail(ctx, job, fmt.Errorf("backfill incomplete: %d row(s) still not synced to %s", remaining, job.NewColumnName))
+	}
+
+	return f.setPhase(ctx, job, state.PhaseCompleted)
+}
+
+// executeRenameTable implements RENAME_TABLE — see strategy.OpRenameTable's
+// own doc comment for the full design rationale (why this doesn't use a
+// plain, instant ALTER TABLE ... RENAME TO on its own).
+//
+// The mechanism: rename the table, then create a VIEW under the OLD name
+// selecting everything from the new one. A plain "SELECT * FROM
+// new_table" (no joins, no aggregates, no DISTINCT/GROUP BY/window
+// functions/set operations — see PostgreSQL's own rules for "simply
+// updatable views") is automatically both readable AND writable by
+// PostgreSQL itself: SELECT, INSERT, UPDATE, and DELETE against the old
+// name all transparently pass through to the renamed table with zero
+// extra machinery (no INSTEAD OF triggers, no rules) needed for the
+// common case of a normal table. A caller still using the old name keeps
+// working exactly as before, for as long as this compatibility view
+// exists.
+//
+// This compatibility view is a deliberate, permanent-until-manually-
+// dropped artifact — same principle as executeRenameColumn's
+// DeprecatedColumnName never being dropped automatically. Cleaning it up
+// (DROP VIEW) once every caller has been redeployed to the new table
+// name is a separate, later, explicit action outside this tool's scope;
+// automatically dropping it would risk breaking a caller that hasn't
+// migrated yet, which is exactly the failure mode this whole mechanism
+// exists to avoid.
+func (f *DDLFlow) executeRenameTable(ctx context.Context, job *state.Job) error {
+	if err := f.setPhase(ctx, job, state.PhasePreparation); err != nil {
+		return err
+	}
+
+	if job.NewTableName == "" {
+		return f.fail(ctx, job, fmt.Errorf("RENAME_TABLE requires a new table name"))
+	}
+
+	renameDDL := fmt.Sprintf("ALTER TABLE %s RENAME TO %s", qualifiedTable(job), quoteIdent(job.NewTableName))
+	if err := execDDLWithLockTimeout(ctx, f.Pool, renameDDL); err != nil {
+		return f.fail(ctx, job, fmt.Errorf("ALTER TABLE ... RENAME TO failed: %w", err))
+	}
+
+	// The new, already-qualified name — RENAME TO never changes schema,
+	// so job.SchemaName is still correct for the renamed table.
+	newQualified := quoteIdent(job.SchemaName) + "." + quoteIdent(job.NewTableName)
+	viewDDL := fmt.Sprintf("CREATE VIEW %s AS SELECT * FROM %s", qualifiedTable(job), newQualified)
+	if _, err := f.Pool.Exec(ctx, viewDDL); err != nil {
+		return f.fail(ctx, job, fmt.Errorf("failed to create backward-compatibility view under the old name: %w", err))
 	}
 
 	return f.setPhase(ctx, job, state.PhaseCompleted)
@@ -1006,6 +1386,12 @@ func (f *DDLFlow) Rollback(ctx context.Context, job *state.Job) error {
 		return f.rollbackAddConstraint(ctx, job)
 	case "RENAME_COLUMN":
 		return f.rollbackRenameColumn(ctx, job)
+	case "RENAME_TABLE":
+		return f.rollbackRenameTable(ctx, job)
+	case "ADD_FOREIGN_KEY":
+		return f.rollbackAddForeignKey(ctx, job)
+	case "ADD_GENERATED_COLUMN":
+		return f.rollbackAddGeneratedColumn(ctx, job)
 	default: // ADD_COLUMN (also the fallback for older jobs with no Operation recorded)
 		return f.rollbackAddColumn(ctx, job)
 	}
@@ -1134,6 +1520,26 @@ func (f *DDLFlow) rollbackAddConstraint(ctx context.Context, job *state.Job) err
 	return f.setPhase(ctx, job, state.PhaseAborted)
 }
 
+// rollbackAddForeignKey reverses ADD_FOREIGN_KEY by dropping the
+// constraint — same reasoning and same safety-at-any-time guarantee as
+// rollbackAddConstraint just above: dropping a foreign key only loosens
+// future writes (referential integrity is no longer enforced going
+// forward), it never touches or deletes any existing row. Unlike
+// rollbackRenameTable's COMPLETED refusal, there's no equivalent "a
+// caller may already be relying on this" risk here — nothing about a
+// completed ADD_FOREIGN_KEY migration changes how existing data reads
+// or is addressed, only what future writes are allowed to do.
+func (f *DDLFlow) rollbackAddForeignKey(ctx context.Context, job *state.Job) error {
+	if job.ConstraintName == "" {
+		return fmt.Errorf("ddlflow: no recorded constraint name on this job — cannot determine what to drop")
+	}
+	ddl := fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s", qualifiedTable(job), quoteIdent(job.ConstraintName))
+	if err := execDDLWithLockTimeout(ctx, f.Pool, ddl); err != nil {
+		return fmt.Errorf("rollback (DROP CONSTRAINT) failed: %w", err)
+	}
+	return f.setPhase(ctx, job, state.PhaseAborted)
+}
+
 // rollbackRenameColumn reverses RENAME_COLUMN by dropping the sync
 // trigger, its function, and the new column — leaving the original (old
 // name) column completely untouched. Safe at ANY time, even long after
@@ -1159,6 +1565,64 @@ func (f *DDLFlow) rollbackRenameColumn(ctx context.Context, job *state.Job) erro
 		if _, err := f.Pool.Exec(ctx, dropColDDL); err != nil {
 			return fmt.Errorf("rollback (drop new column) failed: %w", err)
 		}
+	}
+
+	return f.setPhase(ctx, job, state.PhaseAborted)
+}
+
+// rollbackRenameTable reverses RENAME_TABLE by dropping the
+// compatibility view and renaming the table back to its original name.
+//
+// SAFETY GUARD: like rollbackAddColumn above, this refuses to act on a
+// COMPLETED job — see strategy.OpRenameTable's own doc comment for why
+// the compatibility view exists at all: by the time a RENAME_TABLE job
+// is COMPLETED, application code may already have been redeployed to
+// use the NEW table name directly (not through the view). Rolling back
+// at that point would make the new name disappear out from under a
+// caller that has already moved to it — exactly the failure mode the
+// compatibility view exists to prevent in the first place. Reverting a
+// completed table rename must be a new, deliberate migration (another
+// RENAME_TABLE back to the original name), not an automatic rollback.
+func (f *DDLFlow) rollbackRenameTable(ctx context.Context, job *state.Job) error {
+	if job.Phase == state.PhaseCompleted {
+		return fmt.Errorf("ddlflow: refusing to roll back a COMPLETED RENAME_TABLE migration — " +
+			"application code may already be using the new table name directly; " +
+			"this must be handled as a new, explicit migration (RENAME_TABLE back to the original name), not a rollback")
+	}
+
+	if job.NewTableName == "" {
+		// Failed before NewTableName was even meaningfully in play —
+		// nothing could have been done yet, nothing to undo.
+		return f.setPhase(ctx, job, state.PhaseAborted)
+	}
+
+	// Only drop the compatibility view if the old name CURRENTLY refers
+	// to a VIEW specifically — if the rename never actually happened (a
+	// very early failure, before executeRenameTable's first statement
+	// ran), the old name is still the real TABLE, and DROP VIEW would
+	// error ("... is a table, not a view") even with IF EXISTS, since
+	// IF EXISTS only suppresses a "does not exist" error, not a
+	// wrong-object-type one.
+	var oldNameIsView bool
+	viewCheckQuery := `SELECT EXISTS (SELECT 1 FROM information_schema.views WHERE table_schema = $1 AND table_name = $2)`
+	if err := f.Pool.QueryRow(ctx, viewCheckQuery, job.SchemaName, job.TableName).Scan(&oldNameIsView); err != nil {
+		return fmt.Errorf("rollback (checking for compatibility view) failed: %w", err)
+	}
+	if oldNameIsView {
+		dropViewDDL := fmt.Sprintf("DROP VIEW %s", qualifiedTable(job))
+		if _, err := f.Pool.Exec(ctx, dropViewDDL); err != nil {
+			return fmt.Errorf("rollback (drop compatibility view) failed: %w", err)
+		}
+	}
+
+	// IF EXISTS here is safe (unlike the view case above) — this checks
+	// for ANY object under NewTableName, and if the rename never
+	// happened, there's simply nothing there to rename back, which
+	// IF EXISTS handles as a clean no-op.
+	newQualified := quoteIdent(job.SchemaName) + "." + quoteIdent(job.NewTableName)
+	renameBackDDL := fmt.Sprintf("ALTER TABLE IF EXISTS %s RENAME TO %s", newQualified, quoteIdent(job.TableName))
+	if err := execDDLWithLockTimeout(ctx, f.Pool, renameBackDDL); err != nil {
+		return fmt.Errorf("rollback (rename table back) failed: %w", err)
 	}
 
 	return f.setPhase(ctx, job, state.PhaseAborted)

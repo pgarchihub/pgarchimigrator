@@ -20,31 +20,39 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/pgarchihub/pgarchimigrator/internal/api/ecosystemmanifest"
 	"github.com/pgarchihub/pgarchimigrator/internal/auth"
 	"github.com/pgarchihub/pgarchimigrator/internal/catalog"
 	"github.com/pgarchihub/pgarchimigrator/internal/db"
+	"github.com/pgarchihub/pgarchimigrator/internal/ecosystem"
+	"github.com/pgarchihub/pgarchimigrator/internal/idempotency"
 	"github.com/pgarchihub/pgarchimigrator/internal/orchestrator"
 	"github.com/pgarchihub/pgarchimigrator/internal/preview"
 	"github.com/pgarchihub/pgarchimigrator/internal/progress"
 	"github.com/pgarchihub/pgarchimigrator/internal/reaper"
+	"github.com/pgarchihub/pgarchimigrator/internal/serviceauth"
 	"github.com/pgarchihub/pgarchimigrator/internal/state"
 	"github.com/pgarchihub/pgarchimigrator/internal/strategy"
 	"github.com/pgarchihub/pgarchimigrator/internal/typecompat"
+	"github.com/pgarchihub/pgarchimigrator/internal/upgrade"
 	"github.com/pgarchihub/pgarchimigrator/internal/version"
 )
 
-//go:embed dashboard.html
-var dashboardFS embed.FS
-
 // webappFS embeds the built React SPA (see /web in the repo root —
 // `npm run build` there, output copied into ./webapp). Served at /app,
-// and "/" redirects there — see the routes() registration above for the
-// cutover reasoning. The legacy dashboard.html is kept reachable at
-// /legacy in the meantime.
+// and "/" redirects there — see the routes() registration above. The
+// vanilla-JS dashboard that predated the React SPA (previously kept
+// reachable at /legacy as a transition-period fallback) has been
+// removed: it never supported anything past ADD_COLUMN/ALTER_COLUMN_TYPE
+// (not even v1.0's later operations, let alone any of v2.0's), so it had
+// already stopped being a genuine fallback long before this removal —
+// keeping it around risked someone trusting it as a safety net for
+// operations it silently couldn't perform at all.
 //
 //go:embed webapp
 var webappFS embed.FS
@@ -72,6 +80,31 @@ type Server struct {
 	Store        state.Store
 	Reaper       *reaper.Reaper // optional; nil disables POST /api/sweep (returns 503)
 	AuthService  *auth.Service
+	// ServiceAuth is optional — nil disables POST /oauth/token entirely
+	// (503), matching Reaper's own "feature absent, not silently
+	// broken" precedent just above. A self-hosted operator who has no
+	// need for ecosystem/service-to-service callers at all can simply
+	// not wire this up; every existing cookie-authenticated route is
+	// completely unaffected either way. See
+	// docs/ecosystem/ARCHITECTURE.md for why this is a SEPARATE
+	// authentication surface from AuthService, not a variation on it.
+	ServiceAuth *serviceauth.Service
+	// UpgradeStore/UpgradeConnections are optional — nil disables the
+	// /api/upgrades routes entirely (503), same "absent, not broken"
+	// precedent. See docs/ecosystem/ARCHITECTURE.md's "PostgreSQL
+	// major-version upgrade" section — internal/upgrade is CLI-only as
+	// of that document's last update; these two fields are what let the
+	// same internal/upgrade.Flow/Store also be driven from the
+	// dashboard/API rather than only `pgarchimigrator upgrade start`.
+	UpgradeStore       upgrade.Store
+	UpgradeConnections upgrade.ConnectionProvider
+	// IdempotencyStore is optional — nil means idempotency.Middleware
+	// passes every request through unaffected (never a 503, unlike
+	// ServiceAuth/UpgradeStore above — see that middleware's own doc
+	// comment for why: idempotency is a best-effort additional
+	// guarantee, not a feature a caller is depending on being enforced
+	// in order to work at all).
+	IdempotencyStore idempotency.Store
 	// Pool is used directly (not just through Orchestrator/Store) by
 	// handlePreviewMigration, since internal/preview needs read-only
 	// access to run its dry-run sanity-check queries (e.g. counting
@@ -119,12 +152,17 @@ func NewServer(
 	store state.Store,
 	r *reaper.Reaper,
 	authService *auth.Service,
+	serviceAuth *serviceauth.Service,
+	upgradeStore upgrade.Store,
+	upgradeConnections upgrade.ConnectionProvider,
+	idempotencyStore idempotency.Store,
 	secureCookies bool,
 	pool *pgxpool.Pool,
 	connInfo db.ConnectionInfo,
 ) *Server {
 	s := &Server{
-		Orchestrator: orch, Store: store, Reaper: r, AuthService: authService,
+		Orchestrator: orch, Store: store, Reaper: r, AuthService: authService, ServiceAuth: serviceAuth,
+		UpgradeStore: upgradeStore, UpgradeConnections: upgradeConnections, IdempotencyStore: idempotencyStore,
 		secureCookies: secureCookies, Pool: pool, ConnectionInfo: connInfo,
 		loginLimiter:  newLoginRateLimiter(loginRateLimit, loginRateLimitWindow),
 		lagTracker:    newLagTrendTracker(),
@@ -154,6 +192,17 @@ func (s *Server) routes() {
 	// which build is actually running without needing to be signed in
 	// first (useful for support requests: "what version are you on").
 	s.mux.HandleFunc("GET /api/version", s.handleVersion)
+	s.mux.HandleFunc("GET /api/v1/manifest", s.handleManifest)
+	s.mux.HandleFunc("POST /oauth/token", s.handleOAuthToken)
+	ecosystemMigrations := serviceauth.RequireBearer(s.ServiceAuth,
+		serviceauth.RequireScope("pgarchimigrator.migrate",
+			idempotency.Middleware(s.IdempotencyStore, http.HandlerFunc(s.handleEcosystemStartMigration))))
+	s.mux.HandleFunc("POST /api/v1/migrations", ecosystemMigrations.ServeHTTP)
+
+	ecosystemUpgrades := serviceauth.RequireBearer(s.ServiceAuth,
+		serviceauth.RequireScope("pgarchimigrator.upgrade",
+			idempotency.Middleware(s.IdempotencyStore, http.HandlerFunc(s.handleEcosystemStartUpgrade))))
+	s.mux.HandleFunc("POST /api/v1/upgrades", ecosystemUpgrades.ServeHTTP)
 
 	// Auth endpoints are intentionally NOT wrapped in s.protect — they're
 	// how a session is established (or torn down) in the first place.
@@ -167,6 +216,17 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/auth/me", s.protect(auth.RoleViewer, s.handleMe))
 
 	s.mux.HandleFunc("POST /api/migrations", s.protect(auth.RoleOperator, s.handleStartMigration))
+	s.mux.HandleFunc("POST /api/migrations/{id}/retry", s.protect(auth.RoleOperator, s.handleRetryMigration))
+
+	// Upgrade routes require RoleAdmin, not RoleOperator like migrations
+	// above — a whole-database upgrade (potentially hours long, every
+	// table in scope) is a substantially bigger, riskier action than a
+	// single-table schema change, warranting a stricter minimum role.
+	s.mux.HandleFunc("POST /api/upgrades", s.protect(auth.RoleAdmin, s.handleStartUpgrade))
+	s.mux.HandleFunc("POST /api/upgrades/introspect-source", s.protect(auth.RoleAdmin, s.handleIntrospectUpgradeSource))
+	s.mux.HandleFunc("POST /api/upgrades/{id}/retry", s.protect(auth.RoleAdmin, s.handleRetryUpgrade))
+	s.mux.HandleFunc("GET /api/upgrades", s.protect(auth.RoleOperator, s.handleListUpgrades))
+	s.mux.HandleFunc("GET /api/upgrades/{id}", s.protect(auth.RoleOperator, s.handleGetUpgrade))
 	s.mux.HandleFunc("POST /api/migrations/preview", s.protect(auth.RoleViewer, s.handlePreviewMigration))
 	// Read-only catalog browsing for the New Migration screen's
 	// schema/table/column dropdowns — see internal/catalog's package doc
@@ -216,15 +276,13 @@ func (s *Server) routes() {
 	// "/" redirects to the React SPA at /app — the cutover point, once all
 	// four core screens (Dashboard, New Migration, Migration Detail,
 	// Users) were built and confirmed working end-to-end against a real
-	// server. The legacy vanilla-JS dashboard is kept reachable at
-	// /legacy, not deleted, as a short-term fallback during this
-	// transition — nothing here prevents reverting this one redirect line
-	// if something unexpected turns up.
+	// server. The vanilla-JS dashboard that used to be reachable at
+	// /legacy during the transition period has since been removed — see
+	// webappFS's own doc comment for why.
 	s.mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/app/", http.StatusFound)
 	})
-	s.mux.HandleFunc("GET /legacy", s.handleDashboard) // public: the page itself gates content client-side via /api/auth/me
-	s.registerWebapp()                                 // GET /app/... — the React SPA; see webappFS's doc comment
+	s.registerWebapp() // GET /app/... — the React SPA; see webappFS's doc comment
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -233,6 +291,278 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"version": version.Version})
+}
+
+// handleManifest serves this product's Archi Product Manifest — see
+// internal/api/ecosystemmanifest's own doc comment for why the YAML
+// content is embedded rather than read from a filesystem path, and
+// AC-PF-003 Section 8.2 for the registration flow this endpoint exists
+// to support (ArchiConsole fetches this to learn what pgArchiMigrator
+// can do, before any trust relationship exists yet — so, like
+// /healthz and /api/version above, this is deliberately NOT behind
+// s.protect: a product can't authenticate against an ecosystem it
+// hasn't been discovered by yet).
+func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(ecosystemmanifest.Raw()))
+}
+
+// handleOAuthToken implements the OAuth2 client_credentials grant's
+// token endpoint (RFC 6749 Section 4.4.2/4.4.3) — the entry point a
+// service caller (ArchiConsole or another ecosystem product acting on
+// its behalf) uses to exchange a registered client_id/client_secret for
+// a short-lived Bearer access token, which it then presents to every
+// subsequent request via RequireBearer/RequireScope-protected routes
+// (see docs/ecosystem/ARCHITECTURE.md).
+//
+// Deliberately public (not behind s.protect or RequireBearer itself —
+// a caller doesn't have a token YET, that's the whole point of this
+// endpoint) and deliberately form-encoded, not JSON — RFC 6749 Section
+// 4.4.2 specifies application/x-www-form-urlencoded for this grant, and
+// following that exactly (rather than a JSON body this project's other
+// endpoints would otherwise default to) is what lets an
+// off-the-shelf OAuth2 client library work against this endpoint
+// unmodified.
+//
+// Returns 503 (matching handleSweep's identical "optional dependency
+// wasn't wired up" precedent) if s.ServiceAuth is nil — a self-hosted
+// operator with no need for service-to-service callers never has this
+// endpoint meaningfully enabled.
+func (s *Server) handleOAuthToken(w http.ResponseWriter, r *http.Request) {
+	if s.ServiceAuth == nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("service-to-service authentication is not configured on this instance"))
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "could not parse request body")
+		return
+	}
+
+	if grantType := r.PostForm.Get("grant_type"); grantType != "client_credentials" {
+		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "only grant_type=client_credentials is supported")
+		return
+	}
+
+	clientID := r.PostForm.Get("client_id")
+	clientSecret := r.PostForm.Get("client_secret")
+	if clientID == "" || clientSecret == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "client_id and client_secret are both required")
+		return
+	}
+
+	var requestedScopes []string
+	if raw := r.PostForm.Get("scope"); raw != "" {
+		requestedScopes = strings.Fields(raw) // RFC 6749 Section 3.3: space-delimited
+	}
+
+	rawToken, grantedScopes, expiresAt, err := s.ServiceAuth.IssueToken(r.Context(), clientID, clientSecret, requestedScopes)
+	if err != nil {
+		switch {
+		case errors.Is(err, serviceauth.ErrInvalidClient):
+			writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "invalid client_id or client_secret")
+		case errors.Is(err, serviceauth.ErrInvalidScope):
+			writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope exceeds what this client is registered for")
+		default:
+			writeError(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"access_token": rawToken,
+		"token_type":   "Bearer",
+		"expires_in":   int(time.Until(expiresAt).Seconds()),
+		"scope":        strings.Join(grantedScopes, " "),
+	})
+}
+
+// writeOAuthError writes an RFC 6749 Section 5.2-shaped error body —
+// {"error": "...", "error_description": "..."} — distinct from this
+// file's own writeError (which this project's other, non-OAuth2 JSON
+// endpoints use) specifically because RFC 6749 mandates this exact
+// field-naming, and an OAuth2 client library parsing this response
+// expects it.
+func writeOAuthError(w http.ResponseWriter, status int, code, description string) {
+	writeJSON(w, status, map[string]string{"error": code, "error_description": description})
+}
+
+// operationAcceptedResponse is the 202 Accepted body for
+// handleEcosystemStartMigration — AC-PF-003 Section 13.2's "operation
+// reference" for a long-running command response. jobID doubles as the
+// operation reference here: this product's own job detail page
+// (GET /api/migrations/{id}, already existing) already IS the
+// canonical place to check an operation's status, so this deliberately
+// doesn't invent a second, parallel "operation" concept distinct from
+// a Job.
+type operationAcceptedResponse struct {
+	OperationID string `json:"operationId"`
+	Status      string `json:"status"`
+	StatusURL   string `json:"statusUrl"`
+}
+
+// handleEcosystemStartMigration is the ecosystem-facing counterpart to
+// handleStartMigration — same underlying orchestrator, deliberately
+// different everything else:
+//
+//   - Authentication: OAuth2 Bearer (RequireBearer/RequireScope, see
+//     the route registration below), never the human cookie session
+//     handleStartMigration relies on.
+//   - Response shape: 202 Accepted + an operation reference
+//     (AC-PF-003 Section 13.2), not "200 OK once the migration has
+//     already finished" — see orchestrator.StartMigrationAsync's own
+//     doc comment for why a caller invoking this AS the ecosystem
+//     cannot be expected to block for however long the migration
+//     itself takes.
+//   - Correlation: reads X-Correlation-ID (ArchiOrbit Labs Common API
+//     Contract §5.5 — this specific header name was chosen over
+//     AC-PF-003's own X-Archi-Correlation-Id when the two contracts
+//     conflicted; see docs/ecosystem/ARCHITECTURE.md for the product
+//     decision), plus AC-PF-003 Section 12.3's X-Archi-Lifecycle-Id and
+//     X-Archi-Command-Id (the newer contract doesn't mention either, so
+//     they're unchanged) — the last of these becomes this job's
+//     CausationID, since a "command" in the ecosystem's own vocabulary
+//     is exactly what CAUSES a job to exist; see state.Job.CausationID's
+//     own doc comment) and threads them onto the job, so every ecosystem event
+//     internal/ecosystem.Store publishes for this job's lifecycle
+//     carries the SAME correlation context a consumer used to
+//     originate the request in the first place.
+//
+// Request body is the exact same startMigrationRequest/
+// buildMigrationRequest this product's human-facing endpoint already
+// uses — no second, parallel request schema to keep in sync with the
+// first as new operation types are added.
+func (s *Server) handleEcosystemStartMigration(w http.ResponseWriter, r *http.Request) {
+	var req startMigrationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	migReq, err := buildMigrationRequest(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.resolveTypeCompatibility(r.Context(), &migReq); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	migReq.CorrelationID = r.Header.Get("X-Correlation-ID") // ArchiOrbit Labs Common API Contract §5.5 — takes precedence over AC-PF-003's own X-Archi-Correlation-Id for this specific header, per product decision
+	migReq.LifecycleID = r.Header.Get("X-Archi-Lifecycle-Id")
+	migReq.CausationID = r.Header.Get("X-Archi-Command-Id")
+	if client := serviceauth.ClientFromContext(r.Context()); client != nil {
+		migReq.Actor = "ecosystem:" + client.Name
+	}
+
+	// W3C traceparent (AC-PF-003 §12.3's own recommended header) — see
+	// ecosystem.WithTrace's own doc comment for why this is attached to
+	// ctx rather than persisted on the job itself: it's only ever
+	// meaningful for the ONE event this synchronous request handler
+	// itself publishes (via StartMigrationAsync's own synchronous
+	// prepareJob/Create call), not the job's entire background
+	// lifecycle.
+	ctx := r.Context()
+	if tp := r.Header.Get("traceparent"); tp != "" {
+		if trace, ok := ecosystem.ParseTraceparent(tp); ok {
+			ctx = ecosystem.WithTrace(ctx, trace)
+		}
+	}
+
+	job, err := s.Orchestrator.StartMigrationAsync(ctx, migReq)
+	if job == nil {
+		// No job was ever created — see prepareJob's own doc comment
+		// for exactly which failures land here (a bad stats fetch, an
+		// invalid strategy decision, etc.) vs. which ones still return
+		// a job below.
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err != nil {
+		// A job WAS created (its ID is real and durable) but couldn't
+		// be handed to a Flow — still worth returning 202 with the
+		// job's own reference, since a consumer polling that reference
+		// will correctly see it never left PhasePreflight, rather than
+		// getting a bare error with nothing to look up.
+		log.Printf("ecosystem: job %s created but could not be started: %v", job.ID, err)
+	}
+
+	statusURL := fmt.Sprintf("/api/migrations/%s", job.ID)
+	w.Header().Set("Location", statusURL)
+	writeJSON(w, http.StatusAccepted, operationAcceptedResponse{
+		OperationID: job.ID,
+		Status:      "accepted",
+		StatusURL:   statusURL,
+	})
+}
+
+// handleEcosystemStartUpgrade is handleEcosystemStartMigration's own
+// upgrade counterpart — same OAuth2 Bearer auth (RequireScope
+// "pgarchimigrator.upgrade", not "pgarchimigrator.migrate" — see
+// archi-product-manifest.yaml's own capability entry for
+// migration.postgresql.database.upgrade), same 202 Accepted + operation
+// reference shape, same request body shape as
+// handleStartUpgrade's cookie-authenticated equivalent.
+//
+// One real, documented limitation: upgrade.Job carries no
+// CorrelationID/CausationID/LifecycleID fields the way state.Job does
+// (see that type's own doc comment) — internal/upgrade was designed
+// before this endpoint existed, and adding those fields now would mean
+// a fourth SQLite schema change to upgrade_jobs purely to carry context
+// this endpoint can't yet do anything with beyond the first published
+// event anyway (see ecosystem.WithTrace's own doc comment for the
+// identical reasoning already applied to traceparent). X-Correlation-ID/
+// X-Archi-Lifecycle-Id/X-Archi-Command-Id are therefore read here for
+// symmetry with the migration endpoint but currently have nowhere to
+// go; only traceparent (via ecosystem.WithTrace, scoped to ctx rather
+// than persisted) actually reaches the first published event.
+func (s *Server) handleEcosystemStartUpgrade(w http.ResponseWriter, r *http.Request) {
+	if s.UpgradeStore == nil || s.UpgradeConnections == nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("database upgrade is not configured on this instance"))
+		return
+	}
+
+	var req startUpgradeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if req.SourceDSN == "" || req.TargetDSN == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("sourceDsn and targetDsn are both required"))
+		return
+	}
+
+	ctx := r.Context()
+	if tp := r.Header.Get("traceparent"); tp != "" {
+		if trace, ok := ecosystem.ParseTraceparent(tp); ok {
+			ctx = ecosystem.WithTrace(ctx, trace)
+		}
+	}
+
+	job := &upgrade.Job{
+		Schemas:              req.Schemas,
+		SourceConnectionRef:  req.SourceDSN,
+		TargetConnectionRef:  req.TargetDSN,
+		SourceReplicationRef: req.SourceReplicationDSN,
+		Tables:               req.Tables,
+	}
+	if err := s.UpgradeStore.CreateJob(ctx, job); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to create upgrade job: %w", err))
+		return
+	}
+
+	flow := &upgrade.Flow{Store: s.UpgradeStore, ConnectionProvider: s.UpgradeConnections}
+	go func() {
+		_ = flow.Run(context.Background(), job) // see handleStartUpgrade's own identical goroutine for why context.Background()
+	}()
+
+	statusURL := fmt.Sprintf("/api/upgrades/%s", job.ID)
+	w.Header().Set("Location", statusURL)
+	writeJSON(w, http.StatusAccepted, operationAcceptedResponse{
+		OperationID: job.ID,
+		Status:      "accepted",
+		StatusURL:   statusURL,
+	})
 }
 
 // --- Auth handlers ---
@@ -545,19 +875,40 @@ func (s *Server) handleUpdateUserRole(w http.ResponseWriter, r *http.Request) {
 // detail we still want to accept here, but validating/documenting them at
 // the API boundary separately keeps the two concerns decoupled).
 type startMigrationRequest struct {
-	Schema           string `json:"schema"`
-	Table            string `json:"table"`
-	Column           string `json:"column"`
-	Operation        string `json:"operation"`
-	Type             string `json:"type"`
-	Default          string `json:"default"`
-	VolatileDefault  bool   `json:"volatile_default"`
-	StrategyOverride string `json:"strategy_override"`
-	Actor            string `json:"actor"`
-	IndexName        string `json:"index_name"`       // ADD_INDEX (optional, auto-generated if empty) / DROP_INDEX (required)
-	ConstraintName   string `json:"constraint_name"`  // SET_NOT_NULL (optional, auto-generated if empty) / ADD_CONSTRAINT (required)
-	CheckExpression  string `json:"check_expression"` // ADD_CONSTRAINT only (required)
-	NewColumnName    string `json:"new_column_name"`  // RENAME_COLUMN only (required)
+	Schema              string `json:"schema"`
+	Table               string `json:"table"`
+	Column              string `json:"column"`
+	Operation           string `json:"operation"`
+	Type                string `json:"type"`
+	Default             string `json:"default"`
+	VolatileDefault     bool   `json:"volatile_default"`
+	StrategyOverride    string `json:"strategy_override"`
+	Actor               string `json:"actor"`
+	IndexName           string `json:"index_name"`           // ADD_INDEX (optional, auto-generated if empty) / DROP_INDEX (required)
+	ConstraintName      string `json:"constraint_name"`      // SET_NOT_NULL (optional, auto-generated if empty) / ADD_CONSTRAINT (required)
+	CheckExpression     string `json:"check_expression"`     // ADD_CONSTRAINT only (required)
+	NewColumnName       string `json:"new_column_name"`      // RENAME_COLUMN only (required)
+	NewTableName        string `json:"new_table_name"`       // RENAME_TABLE only (required)
+	ReferencedTable     string `json:"referenced_table"`     // ADD_FOREIGN_KEY only (required)
+	ReferencedColumn    string `json:"referenced_column"`    // ADD_FOREIGN_KEY only (required)
+	OnDelete            string `json:"on_delete"`            // ADD_FOREIGN_KEY only (optional)
+	GeneratedExpression string `json:"generated_expression"` // ADD_GENERATED_COLUMN only (required)
+
+	// The fields below are used ONLY by PARTITION_TABLE. Bounds can be
+	// specified two ways — see strategy.ExpandPartitionRule's own doc
+	// comment for the reasoning: either PartitionBounds directly (an
+	// explicit list, required for LIST partitioning), or, for RANGE
+	// partitioning only, the PartitionInterval/PartitionRuleFrom/
+	// PartitionRuleTo convenience shortcut, which buildMigrationRequest
+	// expands into the same explicit shape before this ever reaches
+	// internal/orchestrator.
+	PartitionColumn         string                    `json:"partition_column"`
+	PartitionStrategy       string                    `json:"partition_strategy"`
+	PartitionIncludeDefault bool                      `json:"partition_include_default"`
+	PartitionBounds         []strategy.PartitionBound `json:"partition_bounds,omitempty"`
+	PartitionInterval       string                    `json:"partition_interval,omitempty"`
+	PartitionRuleFrom       string                    `json:"partition_rule_from,omitempty"`
+	PartitionRuleTo         string                    `json:"partition_rule_to,omitempty"`
 	// Name/Description are purely human-facing, optional labels for the
 	// job — see state.Job.Name's doc comment. Neither affects strategy
 	// selection, validation, or the generated SQL in any way, so
@@ -579,6 +930,12 @@ func buildMigrationRequest(req startMigrationRequest) (orchestrator.MigrationReq
 		return orchestrator.MigrationRequest{}, fmt.Errorf("table and operation are required")
 	}
 
+	// Populated inside the PARTITION_TABLE case below (either directly
+	// from req.PartitionBounds, or expanded from a rule) — declared
+	// here so it's in scope when the final orchestrator.MigrationRequest
+	// gets built further down.
+	var partitionBoundsJSON string
+
 	switch strategy.Operation(req.Operation) {
 	case strategy.OpDropIndex:
 		if req.IndexName == "" {
@@ -598,6 +955,66 @@ func buildMigrationRequest(req startMigrationRequest) (orchestrator.MigrationReq
 		if req.NewColumnName == "" {
 			return orchestrator.MigrationRequest{}, fmt.Errorf("new_column_name is required for RENAME_COLUMN")
 		}
+	case strategy.OpRenameTable:
+		// Deliberately does NOT fall into the default case's "column is
+		// required" check below — this is the one operation this
+		// package supports that operates on the table itself, not any
+		// particular column (see strategy.ColumnChange.NewTableName's
+		// own doc comment).
+		if req.NewTableName == "" {
+			return orchestrator.MigrationRequest{}, fmt.Errorf("new_table_name is required for RENAME_TABLE")
+		}
+	case strategy.OpAddForeignKey:
+		if req.Column == "" {
+			return orchestrator.MigrationRequest{}, fmt.Errorf("column (the local column) is required for ADD_FOREIGN_KEY")
+		}
+		if req.ConstraintName == "" {
+			return orchestrator.MigrationRequest{}, fmt.Errorf("constraint_name is required for ADD_FOREIGN_KEY")
+		}
+		if req.ReferencedTable == "" || req.ReferencedColumn == "" {
+			return orchestrator.MigrationRequest{}, fmt.Errorf("referenced_table and referenced_column are both required for ADD_FOREIGN_KEY")
+		}
+	case strategy.OpAddGeneratedColumn:
+		if req.Column == "" {
+			return orchestrator.MigrationRequest{}, fmt.Errorf("column is required for ADD_GENERATED_COLUMN")
+		}
+		if req.Type == "" {
+			return orchestrator.MigrationRequest{}, fmt.Errorf("type is required for ADD_GENERATED_COLUMN")
+		}
+		if req.GeneratedExpression == "" {
+			return orchestrator.MigrationRequest{}, fmt.Errorf("generated_expression is required for ADD_GENERATED_COLUMN")
+		}
+	case strategy.OpPartitionTable:
+		if req.PartitionColumn == "" {
+			return orchestrator.MigrationRequest{}, fmt.Errorf("partition_column is required for PARTITION_TABLE")
+		}
+		if err := strategy.ValidatePartitionStrategy(req.PartitionStrategy); err != nil {
+			return orchestrator.MigrationRequest{}, err
+		}
+
+		bounds := req.PartitionBounds
+		if len(bounds) == 0 {
+			// No explicit bounds — fall back to the rule-based
+			// convenience shortcut (RANGE only, see
+			// strategy.ExpandPartitionRule's own doc comment).
+			if req.PartitionStrategy != "RANGE" {
+				return orchestrator.MigrationRequest{}, fmt.Errorf("partition_bounds is required for LIST partitioning (no rule-based shortcut exists for it)")
+			}
+			if req.PartitionInterval == "" || req.PartitionRuleFrom == "" || req.PartitionRuleTo == "" {
+				return orchestrator.MigrationRequest{}, fmt.Errorf("either partition_bounds, or all of partition_interval/partition_rule_from/partition_rule_to, is required for PARTITION_TABLE")
+			}
+			expanded, err := strategy.ExpandPartitionRule(req.PartitionInterval, req.PartitionRuleFrom, req.PartitionRuleTo, req.Table)
+			if err != nil {
+				return orchestrator.MigrationRequest{}, err
+			}
+			bounds = expanded
+		}
+
+		boundsJSON, err := json.Marshal(bounds)
+		if err != nil {
+			return orchestrator.MigrationRequest{}, fmt.Errorf("failed to encode partition bounds: %w", err)
+		}
+		partitionBoundsJSON = string(boundsJSON)
 	default:
 		if req.Column == "" {
 			return orchestrator.MigrationRequest{}, fmt.Errorf("column is required for %s", req.Operation)
@@ -617,15 +1034,24 @@ func buildMigrationRequest(req startMigrationRequest) (orchestrator.MigrationReq
 		SchemaName: schema,
 		TableName:  req.Table,
 		Change: strategy.ColumnChange{
-			Operation:         strategy.Operation(req.Operation),
-			ColumnName:        req.Column,
-			NewType:           req.Type,
-			DefaultValue:      req.Default,
-			IsVolatileDefault: req.VolatileDefault,
-			IndexName:         req.IndexName,
-			ConstraintName:    req.ConstraintName,
-			CheckExpression:   req.CheckExpression,
-			NewColumnName:     req.NewColumnName,
+			Operation:               strategy.Operation(req.Operation),
+			ColumnName:              req.Column,
+			NewType:                 req.Type,
+			DefaultValue:            req.Default,
+			IsVolatileDefault:       req.VolatileDefault,
+			IndexName:               req.IndexName,
+			ConstraintName:          req.ConstraintName,
+			CheckExpression:         req.CheckExpression,
+			NewColumnName:           req.NewColumnName,
+			NewTableName:            req.NewTableName,
+			ReferencedTable:         req.ReferencedTable,
+			ReferencedColumn:        req.ReferencedColumn,
+			OnDelete:                req.OnDelete,
+			GeneratedExpression:     req.GeneratedExpression,
+			PartitionColumn:         req.PartitionColumn,
+			PartitionStrategy:       req.PartitionStrategy,
+			PartitionBoundsJSON:     partitionBoundsJSON,
+			PartitionIncludeDefault: req.PartitionIncludeDefault,
 		},
 		StrategyOverride: strategy.Strategy(req.StrategyOverride),
 		Actor:            actor,
@@ -791,6 +1217,100 @@ func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, progress.Compute(job))
 }
 
+// buildMigrationRequestFromJob reconstructs a MigrationRequest from an
+// EXISTING job's own already-persisted fields — the retry path's
+// counterpart to buildMigrationRequest, which builds one from a fresh
+// JSON request body instead. Deliberately skips buildMigrationRequest's
+// own per-operation validation (e.g. "constraint_name is required for
+// ADD_CONSTRAINT") — job's fields were already validated once, the
+// first time this exact migration was started; re-validating identical,
+// already-accepted data on every retry would be pure overhead with no
+// real safety benefit. Name/Description are intentionally NOT copied —
+// see handleRetryMigration's own doc comment for why a retry is
+// deliberately a distinct migration, not a resumption of the failed
+// one, and carrying over a label like "attempt 1 of Q3 billing update"
+// verbatim onto a new job would misdescribe it.
+func buildMigrationRequestFromJob(job *state.Job) orchestrator.MigrationRequest {
+	return orchestrator.MigrationRequest{
+		SchemaName: job.SchemaName,
+		TableName:  job.TableName,
+		Change: strategy.ColumnChange{
+			Operation:               strategy.Operation(job.Operation),
+			ColumnName:              job.ColumnName,
+			NewType:                 job.ColumnType,
+			DefaultValue:            job.DefaultValue,
+			IsVolatileDefault:       job.IsVolatileDefault,
+			IndexName:               job.IndexName,
+			ConstraintName:          job.ConstraintName,
+			CheckExpression:         job.CheckExpression,
+			NewColumnName:           job.NewColumnName,
+			NewTableName:            job.NewTableName,
+			ReferencedTable:         job.ReferencedTable,
+			ReferencedColumn:        job.ReferencedColumn,
+			OnDelete:                job.OnDelete,
+			GeneratedExpression:     job.GeneratedExpression,
+			PartitionColumn:         job.PartitionColumn,
+			PartitionStrategy:       job.PartitionStrategy,
+			PartitionBoundsJSON:     job.PartitionBoundsJSON,
+			PartitionIncludeDefault: job.PartitionIncludeDefault,
+			// TypeConversionCompatible is deliberately left unset here —
+			// it's a DERIVED field (see resolveTypeCompatibility, called
+			// separately by both handleStartMigration and
+			// handleRetryMigration below), never a caller-supplied one,
+			// so there's nothing to copy from job in the first place.
+		},
+	}
+}
+
+// handleRetryMigration starts a NEW migration using the SAME
+// schema/table/operation parameters as an existing job — the direct
+// answer to "let me re-run a failed migration without typing everything
+// again." Deliberately creates a genuinely NEW job (a fresh ID, its own
+// full lifecycle) rather than resuming/resetting the failed one in
+// place — this project's own established DDL-flow/shadow-flow state
+// machines have no "reset a FAILED job back to its start" operation
+// (Phase transitions are one-directional outside of Rollback, which
+// itself only applies to a job that reached ROLLBACK_WINDOW, not one
+// that failed earlier), so "retry" here means "start over," matching
+// what a person re-running a failed `pgarchimigrator migrate` command
+// from the CLI would also get: a new job, new ID, same parameters.
+//
+// Works for a job in ANY phase, not just FAILED — the dashboard only
+// shows this action for a failed job (see MigrationDetail.tsx), but the
+// API itself has no principled reason to refuse retrying a COMPLETED
+// one too (e.g. re-applying the identical change to re-verify it, or
+// because the caller genuinely wants a second, independent run).
+func (s *Server) handleRetryMigration(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	original, err := s.Store.Get(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, fmt.Errorf("migration job %s not found: %w", id, err))
+		return
+	}
+
+	migReq := buildMigrationRequestFromJob(original)
+	if client := serviceauth.ClientFromContext(r.Context()); client != nil {
+		migReq.Actor = "ecosystem:" + client.Name
+	} else if u := auth.UserFromContext(r.Context()); u != nil {
+		migReq.Actor = u.Email
+	}
+	if err := s.resolveTypeCompatibility(r.Context(), &migReq); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	job, err := s.Orchestrator.StartMigration(r.Context(), migReq)
+	if job == nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	status := http.StatusOK
+	if err != nil {
+		status = http.StatusUnprocessableEntity
+	}
+	writeJSON(w, status, progress.Compute(job))
+}
+
 func (s *Server) handleListMigrations(w http.ResponseWriter, r *http.Request) {
 	jobs, err := s.Store.ListAll(r.Context())
 	if err != nil {
@@ -878,16 +1398,6 @@ func (s *Server) handleSweep(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, status, resp)
-}
-
-func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	data, err := dashboardFS.ReadFile("dashboard.html")
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	_, _ = w.Write(data)
 }
 
 // registerWebapp mounts the embedded React SPA at /app/. If the embedded

@@ -1,0 +1,21 @@
+{
+  "$comment": "AOL-STD-DEPLOY-001 §12's three-channel model. pgArchiMigrator 2.0's Community Edition ships at 'internal' initially — see AOL-STD-DEPLOY-001 §6: 'Version 2.0 MUST remain unpublished and non-installable in the public catalog until all release gates in section 12 pass.' The full 'stable' gate list (native code signing, SBOM, certified installer) is deferred to the Enterprise release per product decision — see docs/ecosystem/ARCHITECTURE.md.",
+  "current": "internal",
+  "channels": [
+    {
+      "id": "internal",
+      "audience": "Engineering validation",
+      "installableFromPublicArchiConsole": false
+    },
+    {
+      "id": "preview",
+      "audience": "Explicit opt-in testers",
+      "installableFromPublicArchiConsole": "only after preview approval and signing"
+    },
+    {
+      "id": "stable",
+      "audience": "General users",
+      "installableFromPublicArchiConsole": "yes, after all stable gates (AOL-STD-DEPLOY-001 §12)"
+    }
+  ]
+}

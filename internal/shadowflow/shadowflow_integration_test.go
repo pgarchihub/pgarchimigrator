@@ -446,3 +446,303 @@ func testResourceNames(jobID, tableName string) testNames {
 		pubName:     fmt.Sprintf("pgam_pub_%s_%s", safeTable, safeID),
 	}
 }
+
+// TestExecute_PartitionTable_Range_EndToEnd_DataLandsInCorrectPartitions
+// is the full end-to-end proof that PARTITION_TABLE genuinely works
+// against real PostgreSQL, not just against gofmt syntax checking — see
+// internal/shadowflow.prepare's own doc comment for the mechanism this
+// exercises: a real, natively-partitioned shadow table built alongside
+// the original, synced via logical replication (including a row
+// inserted WHILE the migration is running, proving Delta Sync — not
+// just Initial Sync's static snapshot — catches it), then swapped in
+// atomically. Confirms every row (both pre-existing and the one
+// inserted during the run) lands in the CORRECT RANGE partition, not
+// just "somewhere in the table".
+func TestExecute_PartitionTable_Range_EndToEnd_DataLandsInCorrectPartitions(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+
+	sourceTable := "shadowflow_partition_range_source"
+	jobID := "partition-range-1"
+
+	_, _ = pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, sourceTable))
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s (id BIGINT PRIMARY KEY, created_at DATE NOT NULL)
+	`, sourceTable)); err != nil {
+		t.Fatalf("could not create source table: %v", err)
+	}
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %s (id, created_at) VALUES (1, '2024-01-15'), (2, '2024-02-20')
+	`, sourceTable)); err != nil {
+		t.Fatalf("could not seed source table: %v", err)
+	}
+
+	names := testResourceNames(jobID, sourceTable)
+	shadowJanuary := names.shadowTable + "_jan"
+	shadowFebruary := names.shadowTable + "_feb"
+	t.Cleanup(func() {
+		bg := context.Background()
+		_, _ = pool.Exec(bg, fmt.Sprintf(`DROP PUBLICATION IF EXISTS %s`, names.pubName))
+		_, _ = pool.Exec(bg, `SELECT pg_drop_replication_slot($1)`, names.slotName)
+		_, _ = pool.Exec(bg, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, sourceTable))
+		_, _ = pool.Exec(bg, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, names.shadowTable))
+	})
+
+	boundsJSON := fmt.Sprintf(`[
+		{"name": %q, "from": "2024-01-01", "to": "2024-02-01"},
+		{"name": %q, "from": "2024-02-01", "to": "2024-03-01"}
+	]`, shadowJanuary, shadowFebruary)
+
+	store := newTestStore(t)
+	job := &state.Job{
+		ID: jobID, SchemaName: "public", TableName: sourceTable,
+		Strategy: "SHADOW_TABLE", Phase: state.PhasePreflight,
+		Operation: "PARTITION_TABLE", PartitionColumn: "created_at", PartitionStrategy: "RANGE",
+		PartitionBoundsJSON: boundsJSON,
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+
+	preflighter := db.NewPgxPreflighter(pool)
+	flow := shadowflow.New(pool, shadowflow.ReplicationDSN(logicalDSN), store, preflighter)
+
+	// A write WHILE Execute runs, proving Delta Sync (not just Initial
+	// Sync's static snapshot) correctly routes it to the January
+	// partition too.
+	go func() {
+		time.Sleep(1 * time.Second)
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`INSERT INTO %s (id, created_at) VALUES (3, '2024-01-28')`, sourceTable))
+	}()
+
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if job.Phase != state.PhaseRollbackWindow {
+		t.Fatalf("expected Phase=ROLLBACK_WINDOW after a successful swap, got %s", job.Phase)
+	}
+
+	// After the swap, sourceTable IS the partitioned table — confirm
+	// it's genuinely partitioned (not just a plain table that happens
+	// to have the right rows).
+	var isPartitioned bool
+	partCheckQuery := `SELECT EXISTS (SELECT 1 FROM pg_partitioned_table pt JOIN pg_class c ON c.oid = pt.partrelid WHERE c.relname = $1)`
+	if err := pool.QueryRow(ctx, partCheckQuery, sourceTable).Scan(&isPartitioned); err != nil {
+		t.Fatalf("partition check failed: %v", err)
+	}
+	if !isPartitioned {
+		t.Error("expected the swapped-in table to genuinely be a partitioned table")
+	}
+
+	// Every row (via the parent) must still be readable, regardless of
+	// which physical partition it landed in.
+	var totalRows int
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, sourceTable)).Scan(&totalRows); err != nil {
+		t.Fatalf("could not count rows via the parent: %v", err)
+	}
+	if totalRows != 3 {
+		t.Errorf("expected 3 rows (2 pre-existing + 1 from Delta Sync), got %d", totalRows)
+	}
+
+	// The critical check: each row must be in the CORRECT partition,
+	// not just "somewhere in the partitioned table".
+	var januaryCount int
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, shadowJanuary)).Scan(&januaryCount); err != nil {
+		t.Fatalf("could not count rows in the January partition: %v", err)
+	}
+	if januaryCount != 2 {
+		t.Errorf("expected 2 rows in the January partition (id=1 and the Delta-Sync'd id=3), got %d", januaryCount)
+	}
+
+	var februaryCount int
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, shadowFebruary)).Scan(&februaryCount); err != nil {
+		t.Fatalf("could not count rows in the February partition: %v", err)
+	}
+	if februaryCount != 1 {
+		t.Errorf("expected 1 row in the February partition (id=2), got %d", februaryCount)
+	}
+}
+
+// TestExecute_PartitionTable_List_EndToEnd_DataLandsInCorrectPartitions
+// mirrors the RANGE test above for LIST partitioning — confirms rows
+// route to the partition matching their actual value, not just RANGE's
+// numeric/date ordering.
+func TestExecute_PartitionTable_List_EndToEnd_DataLandsInCorrectPartitions(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+
+	sourceTable := "shadowflow_partition_list_source"
+	jobID := "partition-list-1"
+
+	_, _ = pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, sourceTable))
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s (id BIGINT PRIMARY KEY, region TEXT NOT NULL)
+	`, sourceTable)); err != nil {
+		t.Fatalf("could not create source table: %v", err)
+	}
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %s (id, region) VALUES (1, 'DE'), (2, 'US')
+	`, sourceTable)); err != nil {
+		t.Fatalf("could not seed source table: %v", err)
+	}
+
+	names := testResourceNames(jobID, sourceTable)
+	shadowEU := names.shadowTable + "_eu"
+	shadowUS := names.shadowTable + "_us"
+	t.Cleanup(func() {
+		bg := context.Background()
+		_, _ = pool.Exec(bg, fmt.Sprintf(`DROP PUBLICATION IF EXISTS %s`, names.pubName))
+		_, _ = pool.Exec(bg, `SELECT pg_drop_replication_slot($1)`, names.slotName)
+		_, _ = pool.Exec(bg, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, sourceTable))
+		_, _ = pool.Exec(bg, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, names.shadowTable))
+	})
+
+	boundsJSON := fmt.Sprintf(`[
+		{"name": %q, "values": ["DE", "FR"]},
+		{"name": %q, "values": ["US"]}
+	]`, shadowEU, shadowUS)
+
+	store := newTestStore(t)
+	job := &state.Job{
+		ID: jobID, SchemaName: "public", TableName: sourceTable,
+		Strategy: "SHADOW_TABLE", Phase: state.PhasePreflight,
+		Operation: "PARTITION_TABLE", PartitionColumn: "region", PartitionStrategy: "LIST",
+		PartitionBoundsJSON: boundsJSON,
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+
+	preflighter := db.NewPgxPreflighter(pool)
+	flow := shadowflow.New(pool, shadowflow.ReplicationDSN(logicalDSN), store, preflighter)
+
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if job.Phase != state.PhaseRollbackWindow {
+		t.Fatalf("expected Phase=ROLLBACK_WINDOW after a successful swap, got %s", job.Phase)
+	}
+
+	var euCount int
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, shadowEU)).Scan(&euCount); err != nil {
+		t.Fatalf("could not count rows in the EU partition: %v", err)
+	}
+	if euCount != 1 {
+		t.Errorf("expected 1 row in the EU partition (DE), got %d", euCount)
+	}
+
+	var usCount int
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, shadowUS)).Scan(&usCount); err != nil {
+		t.Fatalf("could not count rows in the US partition: %v", err)
+	}
+	if usCount != 1 {
+		t.Errorf("expected 1 row in the US partition, got %d", usCount)
+	}
+}
+
+// TestExecute_PartitionTable_DefaultPartition_CatchesOutOfRangeRows is
+// the direct regression test for PartitionIncludeDefault actually
+// working — a row whose value doesn't match any explicit bound must
+// land in the DEFAULT partition, not cause the whole migration to fail.
+func TestExecute_PartitionTable_DefaultPartition_CatchesOutOfRangeRows(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+
+	sourceTable := "shadowflow_partition_default_source"
+	jobID := "partition-default-1"
+
+	_, _ = pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, sourceTable))
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s (id BIGINT PRIMARY KEY, region TEXT NOT NULL)
+	`, sourceTable)); err != nil {
+		t.Fatalf("could not create source table: %v", err)
+	}
+	// "JP" matches no explicit bound below — must land in DEFAULT.
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %s (id, region) VALUES (1, 'DE'), (2, 'JP')
+	`, sourceTable)); err != nil {
+		t.Fatalf("could not seed source table: %v", err)
+	}
+
+	names := testResourceNames(jobID, sourceTable)
+	shadowEU := names.shadowTable + "_eu"
+	shadowDefault := names.shadowTable + "_default"
+	t.Cleanup(func() {
+		bg := context.Background()
+		_, _ = pool.Exec(bg, fmt.Sprintf(`DROP PUBLICATION IF EXISTS %s`, names.pubName))
+		_, _ = pool.Exec(bg, `SELECT pg_drop_replication_slot($1)`, names.slotName)
+		_, _ = pool.Exec(bg, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, sourceTable))
+		_, _ = pool.Exec(bg, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, names.shadowTable))
+	})
+
+	boundsJSON := fmt.Sprintf(`[{"name": %q, "values": ["DE", "FR"]}]`, shadowEU)
+
+	store := newTestStore(t)
+	job := &state.Job{
+		ID: jobID, SchemaName: "public", TableName: sourceTable,
+		Strategy: "SHADOW_TABLE", Phase: state.PhasePreflight,
+		Operation: "PARTITION_TABLE", PartitionColumn: "region", PartitionStrategy: "LIST",
+		PartitionBoundsJSON: boundsJSON, PartitionIncludeDefault: true,
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+
+	preflighter := db.NewPgxPreflighter(pool)
+	flow := shadowflow.New(pool, shadowflow.ReplicationDSN(logicalDSN), store, preflighter)
+
+	if err := flow.Execute(ctx, job); err != nil {
+		t.Fatalf("Execute failed (without a DEFAULT partition, the 'JP' row would have made this fail): %v", err)
+	}
+
+	var defaultCount int
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, shadowDefault)).Scan(&defaultCount); err != nil {
+		t.Fatalf("could not count rows in the DEFAULT partition: %v", err)
+	}
+	if defaultCount != 1 {
+		t.Errorf("expected 1 row ('JP') in the DEFAULT partition, got %d", defaultCount)
+	}
+}
+
+// TestExecute_PartitionTable_MissingBounds_Fails confirms a job with no
+// partition bounds at all fails cleanly during Preparation, rather than
+// producing a partitioned table with zero partitions (which PostgreSQL
+// would itself reject any row insertion into, silently or not).
+func TestExecute_PartitionTable_MissingBounds_Fails(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+
+	sourceTable := "shadowflow_partition_missing_source"
+	jobID := "partition-missing-1"
+
+	_, _ = pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, sourceTable))
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s (id BIGINT PRIMARY KEY, region TEXT NOT NULL)
+	`, sourceTable)); err != nil {
+		t.Fatalf("could not create source table: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, sourceTable))
+	})
+
+	store := newTestStore(t)
+	job := &state.Job{
+		ID: jobID, SchemaName: "public", TableName: sourceTable,
+		Strategy: "SHADOW_TABLE", Phase: state.PhasePreflight,
+		Operation: "PARTITION_TABLE", PartitionColumn: "region", PartitionStrategy: "LIST",
+		// PartitionBoundsJSON deliberately left empty.
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+
+	preflighter := db.NewPgxPreflighter(pool)
+	flow := shadowflow.New(pool, shadowflow.ReplicationDSN(logicalDSN), store, preflighter)
+
+	if err := flow.Execute(ctx, job); err == nil {
+		t.Fatal("expected Execute to fail for a job with no partition bounds")
+	}
+	if job.Phase != state.PhaseFailed {
+		t.Errorf("expected Phase=FAILED, got %s", job.Phase)
+	}
+}

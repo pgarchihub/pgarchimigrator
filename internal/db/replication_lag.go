@@ -26,8 +26,9 @@ type ReplicationLag struct {
 // FetchReplicationLag queries pg_replication_slots for a single named
 // slot's current lag — used to show a live "is this SHADOW_TABLE
 // migration's delta sync actually catching up, or falling further
-// behind?" indicator (see pgArchiMigrator_Guven_Katmani_Tasarimi.md's
-// Faz 2.1, "Canlı Replication Lag / Yakınsama Göstergesi").
+// behind?" indicator (see this project's own internal Trust Layer
+// Design Document, Phase 2.1, "Live Replication Lag / Convergence
+// Indicator").
 //
 // Why this exists — found the hard way, via a real load test: a
 // SHADOW_TABLE migration's delta-sync phase can, under heavy sustained

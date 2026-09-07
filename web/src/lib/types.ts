@@ -26,7 +26,11 @@ export type Operation =
   | "DROP_INDEX"
   | "SET_NOT_NULL"
   | "ADD_CONSTRAINT"
-  | "RENAME_COLUMN";
+  | "RENAME_COLUMN"
+  | "RENAME_TABLE"
+  | "ADD_FOREIGN_KEY"
+  | "ADD_GENERATED_COLUMN"
+  | "PARTITION_TABLE";
 
 // Mirrors strategy.ValidStrategyMatrix()'s JSON shape — keyed by
 // Operation, each value the list of strategies that operation actually
@@ -190,8 +194,30 @@ export interface StartMigrationRequest {
   constraint_name?: string;
   check_expression?: string;
   new_column_name?: string;
+  new_table_name?: string;
+  referenced_table?: string;
+  referenced_column?: string;
+  on_delete?: string;
+  generated_expression?: string;
+  partition_column?: string;
+  partition_strategy?: string;
+  partition_include_default?: boolean;
+  partition_bounds?: PartitionBound[];
+  partition_interval?: string;
+  partition_rule_from?: string;
+  partition_rule_to?: string;
   name?: string;
   description?: string;
+}
+
+// Mirrors internal/strategy.PartitionBound — one partition's boundary
+// definition. From/To for RANGE, Values for LIST — see PARTITION_TABLE's
+// own form section in NewMigration.tsx for how these get collected.
+export interface PartitionBound {
+  name: string;
+  from?: string;
+  to?: string;
+  values?: string[];
 }
 
 export interface ManagedUser {
@@ -248,3 +274,99 @@ export interface ConnectionInfo {
 export interface SetupRequiredResponse {
   required: boolean;
 }
+
+// Mirrors internal/upgrade.Phase's exact string values — deliberately a
+// DIFFERENT set from MigrationReport's own CurrentPhase (see that Go
+// package's own doc comment: an upgrade's real stages don't map onto a
+// single migration's, there's no SWAPPING/ROLLBACK_WINDOW equivalent
+// here).
+export type UpgradePhase =
+  | "INTROSPECTING"
+  | "SCHEMA_CREATED"
+  | "SYNCING"
+  | "VALIDATING"
+  | "READY"
+  | "FAILED"
+  | "ABORTED";
+
+// Mirrors internal/upgrade.Job — note this has NO JSON tags on the Go
+// side (see that struct's own field list), so field names arrive
+// exactly as Go wrote them (PascalCase), unlike most of this file's
+// other types.
+export interface UpgradeJob {
+  ID: string;
+  Phase: UpgradePhase;
+  Schemas: string[] | null;
+  SourceConnectionRef: string;
+  TargetConnectionRef: string;
+  // SourceReplicationRef/Tables were added to the Go struct after
+  // UpgradeJob was first written here — see internal/upgrade.Job's own
+  // doc comments for SourceReplicationRef (the replication-specific
+  // override) and Tables (explicit table-level scoping). Both are
+  // empty/null for a job that never used the "Advanced" override or
+  // the checkbox picker — matching the Go side's own zero values.
+  SourceReplicationRef: string;
+  Tables: TableRef[] | null;
+  LastError: string;
+  CreatedAt: string;
+  UpdatedAt: string;
+  TablesTotal: number;
+  TablesSynced: number;
+  TablesVerified: number;
+}
+
+// Mirrors internal/upgrade.Table — same "no JSON tags, PascalCase"
+// note as UpgradeJob above.
+export interface UpgradeTable {
+  JobID: string;
+  SchemaName: string;
+  TableName: string;
+  Phase: UpgradePhase;
+  RowsSynced: number;
+  LastError: string;
+}
+
+// Mirrors internal/api's own upgradeDetailResponse — UpgradeJob's own
+// fields flattened alongside a "tables" array (Go's embedded-struct
+// JSON marshaling: `*upgrade.Job` embedded directly, `Tables` with an
+// explicit lowercase json tag — see that Go type's own doc comment).
+export interface UpgradeDetail extends UpgradeJob {
+  tables: UpgradeTable[] | null;
+}
+
+// Mirrors internal/upgrade.TableRef's own json tags (schema/table).
+export interface TableRef {
+  schema: string;
+  table: string;
+}
+
+// Mirrors internal/api's own introspectedSchema/introspectSourceResponse
+// — the dashboard's schema/table checkbox picker's own data source (see
+// NewUpgrade.tsx and ui/SchemaTablePicker.tsx).
+export interface IntrospectedSchema {
+  name: string;
+  tables: string[];
+}
+
+export interface IntrospectSourceResponse {
+  schemas: IntrospectedSchema[];
+}
+
+// Mirrors internal/api's own startUpgradeRequest.
+export interface StartUpgradeRequest {
+  sourceDsn: string;
+  targetDsn: string;
+  schemas?: string[];
+  // Optional — see internal/upgrade.Job.SourceReplicationRef's own doc
+  // comment for exactly when this differs from sourceDsn: whenever this
+  // server process and the TARGET instance's own PostgreSQL server have
+  // a different network view of the source (e.g. a Docker Compose test
+  // setup where this server reaches source via a host-mapped port but
+  // the target container must use the Compose network's own hostname).
+  sourceReplicationDsn?: string;
+  // Optional, explicit table-level scoping — mutually exclusive with
+  // schemas (see internal/upgrade.Job.Tables' own doc comment): the
+  // checkbox picker always sends one or the other, never both.
+  tables?: TableRef[];
+}
+

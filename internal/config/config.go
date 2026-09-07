@@ -28,6 +28,8 @@ type Config struct {
 	StateDBPath string `yaml:"state_db_path"` // SQLite file path (TR-13: single-instance)
 
 	AuthDBPath string `yaml:"auth_db_path"` // SQLite file path for internal/auth's users/sessions — deliberately a SEPARATE file from StateDBPath, see internal/auth's package doc comment
+
+	UpgradeDBPath string `yaml:"upgrade_db_path"` // SQLite file path for internal/upgrade's job/table progress — deliberately its own file, see internal/upgrade.SQLiteStore's own doc comment on why write isolation from StateDBPath matters here specifically
 }
 
 // Default returns a Config populated with the defaults from the
@@ -41,6 +43,7 @@ func Default() Config {
 		MinPostgresVersion:     12,
 		StateDBPath:            "./pgarchimigrator-state.db",
 		AuthDBPath:             "./pgarchimigrator-auth.db",
+		UpgradeDBPath:          "./pgarchimigrator-upgrade.db",
 	}
 }
 
