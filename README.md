@@ -23,24 +23,25 @@ accurate for the backend's package layout.
 
 ## Screenshots
 
-**Migration list** — every migration tracked from start to rollback
-window, with fleet-wide analytics (failure rate, average duration, a
-per-strategy breakdown) computed from the same history.
+**New migration** — the screen shows exactly which host, database, and
+PostgreSQL version it's connected to before you pick an operation, with
+`ADD_FOREIGN_KEY`'s referenced table/column populated from the schema
+itself (primary keys marked) instead of typed from memory.
 
-![Migration list](docs/images/pgArchiMigrator_01_Migration_List.png)
+![New migration](docs/images/pgArchiMigrator_01_New_Migration.png)
 
-**Migration detail** — a health summary, live progress, resource-cleanup
-verification, and the exact duration and row count for every completed
-migration.
+**Migration detail** — the exact SQL a completed migration ran, plus a
+step-by-step progress trace and a rollback window. Here, `RENAME_TABLE`
+left a backward-compatible view under the old name.
 
 ![Migration detail](docs/images/pgArchiMigrator_02_Migration_Detail.png)
 
-**New migration** — automatic strategy selection (here, a 10M-row
-`ALTER COLUMN TYPE` correctly routed to `SHADOW_TABLE`), with a live
-dry-run preview, warnings, and the table's real schema and sample data
-before anything runs.
+**Database migration detail** — a completed whole-database move: every
+in-scope table synced and verified via PostgreSQL's own native logical
+replication. Cutover stays a separate, deliberate step you take
+yourself.
 
-![New migration](docs/images/pgArchiMigrator_03_New_Migration.png)
+![Database migration detail](docs/images/pgArchiMigrator_03_Database_Migration_Detail.png)
 
 ## Supported PostgreSQL Versions
 
