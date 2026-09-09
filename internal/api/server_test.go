@@ -1,4 +1,4 @@
-package api_test
+package api
 
 import (
 	"context"
@@ -14,7 +14,6 @@ import (
 
 	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/db"
 	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/upgrade"
-	"github.com/pgarchihub/pgarchimigrator/internal/api"
 	"github.com/pgarchihub/pgarchimigrator/internal/auth"
 	"github.com/pgarchihub/pgarchimigrator/internal/idempotency"
 	"github.com/pgarchihub/pgarchimigrator/internal/orchestrator"
@@ -179,7 +178,7 @@ type testUsers struct {
 	viewer   *http.Cookie
 }
 
-func newTestServer(t *testing.T, store *fakeStore, flow *fakeFlow) (*api.Server, *testUsers) {
+func newTestServer(t *testing.T, store *fakeStore, flow *fakeFlow) (*Server, *testUsers) {
 	t.Helper()
 
 	orch := orchestrator.New(store,
@@ -201,7 +200,7 @@ func newTestServer(t *testing.T, store *fakeStore, flow *fakeFlow) (*api.Server,
 		t.Fatalf("could not create test organization: %v", err)
 	}
 
-	srv := api.NewServer(orch, store, nil, authService, nil, nil, nil, nil, false, nil, db.ConnectionInfo{}) // nil Reaper: sweep endpoint tested separately; nil pool: preview endpoint needs a real Postgres, tested in engines/postgresql/preview instead
+	srv := NewServer(orch, store, nil, authService, nil, nil, nil, nil, false, nil, db.ConnectionInfo{}) // nil Reaper: sweep endpoint tested separately; nil pool: preview endpoint needs a real Postgres, tested in engines/postgresql/preview instead
 
 	users := &testUsers{
 		org:      org,
@@ -238,7 +237,7 @@ func mustLogin(t *testing.T, svc *auth.Service, orgID, email string, role auth.R
 
 // doRequest issues a request against srv. cookie may be nil for an
 // unauthenticated request.
-func doRequest(t *testing.T, srv *api.Server, method, path string, body any, cookie *http.Cookie) *httptest.ResponseRecorder {
+func doRequest(t *testing.T, srv *Server, method, path string, body any, cookie *http.Cookie) *httptest.ResponseRecorder {
 	t.Helper()
 	var reqBody *strings.Reader
 	if body != nil {
@@ -266,7 +265,7 @@ func doRequest(t *testing.T, srv *api.Server, method, path string, body any, coo
 // other test in this file). This is deliberately separate: the setup
 // flow's entire purpose only exists to be tested against a deployment
 // that hasn't been bootstrapped yet.
-func newSetupTestServer(t *testing.T) *api.Server {
+func newSetupTestServer(t *testing.T) *Server {
 	t.Helper()
 	store := newFakeStore()
 	orch := orchestrator.New(store,
@@ -281,7 +280,7 @@ func newSetupTestServer(t *testing.T) *api.Server {
 	}
 	t.Cleanup(func() { authStore.Close() })
 	authService := auth.NewService(authStore)
-	return api.NewServer(orch, store, nil, authService, nil, nil, nil, nil, false, nil, db.ConnectionInfo{})
+	return NewServer(orch, store, nil, authService, nil, nil, nil, nil, false, nil, db.ConnectionInfo{})
 }
 
 func TestHandleSetupRequired_TrueOnFreshDeployment(t *testing.T) {
@@ -502,7 +501,7 @@ func TestHandleGetConnectionInfo_ReturnsFieldsButNeverAPassword(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseConnectionInfo failed: %v", err)
 	}
-	srv := api.NewServer(orch, store, nil, authService, nil, nil, nil, nil, false, nil, connInfo)
+	srv := NewServer(orch, store, nil, authService, nil, nil, nil, nil, false, nil, connInfo)
 
 	rec := doRequest(t, srv, http.MethodGet, "/api/connection", nil, viewerCookie)
 	if rec.Code != http.StatusOK {
@@ -952,7 +951,7 @@ func TestHandleDeleteUser_CannotDeleteSelf(t *testing.T) {
 // viewerUserID looks up the seed viewer user's ID via /api/users (as an
 // admin) — a stable target for the role-update tests below, distinct
 // from whichever admin cookie is making the request.
-func viewerUserID(t *testing.T, srv *api.Server, adminCookie *http.Cookie) string {
+func viewerUserID(t *testing.T, srv *Server, adminCookie *http.Cookie) string {
 	t.Helper()
 	rec := doRequest(t, srv, http.MethodGet, "/api/users", nil, adminCookie)
 	var list []map[string]any
@@ -1056,7 +1055,7 @@ func TestHandleUpdateUserRole_CannotChangeOwnRole(t *testing.T) {
 // RFC 6749 Section 4.4.2 mandates application/x-www-form-urlencoded for
 // the client_credentials grant, and handleOAuthToken parses the request
 // with r.ParseForm accordingly.
-func doOAuthRequest(t *testing.T, srv *api.Server, form url.Values) *httptest.ResponseRecorder {
+func doOAuthRequest(t *testing.T, srv *Server, form url.Values) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -1070,7 +1069,7 @@ func doOAuthRequest(t *testing.T, srv *api.Server, form url.Values) *httptest.Re
 // — see its own NewServer call — since most tests have no need for it).
 // Returns the registered test client's raw credentials alongside the
 // server, for tests to exchange at /oauth/token.
-func newTestServerWithServiceAuth(t *testing.T, store *fakeStore, flow *fakeFlow, scopes []string) (srv *api.Server, clientID, clientSecret string) {
+func newTestServerWithServiceAuth(t *testing.T, store *fakeStore, flow *fakeFlow, scopes []string) (srv *Server, clientID, clientSecret string) {
 	t.Helper()
 
 	orch := orchestrator.New(store,
@@ -1103,7 +1102,7 @@ func newTestServerWithServiceAuth(t *testing.T, store *fakeStore, flow *fakeFlow
 		t.Fatalf("could not create test client: %v", err)
 	}
 
-	srv = api.NewServer(orch, store, nil, authService, svcAuthService, nil, nil, nil, false, nil, db.ConnectionInfo{})
+	srv = NewServer(orch, store, nil, authService, svcAuthService, nil, nil, nil, false, nil, db.ConnectionInfo{})
 	return srv, client.ClientID, rawSecret
 }
 
@@ -1112,7 +1111,7 @@ func newTestServerWithServiceAuth(t *testing.T, store *fakeStore, flow *fakeFlow
 // newTestServerWithUpgrade's own real upgrade.SQLiteStore — needed for
 // handleEcosystemStartUpgrade's own tests, which (unlike
 // handleEcosystemStartMigration's) require BOTH wired up at once.
-func newTestServerWithServiceAuthAndUpgrade(t *testing.T, scopes []string) (srv *api.Server, clientID, clientSecret string) {
+func newTestServerWithServiceAuthAndUpgrade(t *testing.T, scopes []string) (srv *Server, clientID, clientSecret string) {
 	t.Helper()
 
 	orch := orchestrator.New(newFakeStore(),
@@ -1157,7 +1156,7 @@ func newTestServerWithServiceAuthAndUpgrade(t *testing.T, scopes []string) (srv 
 	}
 	t.Cleanup(func() { idempotencyStore.Close() })
 
-	srv = api.NewServer(orch, newFakeStore(), nil, authService, svcAuthService, upgradeStore, upgrade.StaticConnectionProvider{}, idempotencyStore, false, nil, db.ConnectionInfo{})
+	srv = NewServer(orch, newFakeStore(), nil, authService, svcAuthService, upgradeStore, upgrade.StaticConnectionProvider{}, idempotencyStore, false, nil, db.ConnectionInfo{})
 	return srv, client.ClientID, rawSecret
 }
 
@@ -1443,8 +1442,8 @@ func TestHandleStartUpgrade_RequiresAdminRole(t *testing.T) {
 // newTestServerWithUpgrade mirrors newTestServerWithServiceAuth's own
 // pattern — a real upgrade.SQLiteStore (this package has no non-SQLite
 // Store implementation, matching internal/auth/internal/serviceauth's
-// own precedent), wired into a real *api.Server.
-func newTestServerWithUpgrade(t *testing.T) (*api.Server, *testUsers) {
+// own precedent), wired into a real *Server.
+func newTestServerWithUpgrade(t *testing.T) (*Server, *testUsers) {
 	t.Helper()
 
 	orch := orchestrator.New(newFakeStore(),
@@ -1472,7 +1471,7 @@ func newTestServerWithUpgrade(t *testing.T) (*api.Server, *testUsers) {
 	}
 	t.Cleanup(func() { upgradeStore.Close() })
 
-	srv := api.NewServer(orch, newFakeStore(), nil, authService, nil, upgradeStore, upgrade.StaticConnectionProvider{}, nil, false, nil, db.ConnectionInfo{})
+	srv := NewServer(orch, newFakeStore(), nil, authService, nil, upgradeStore, upgrade.StaticConnectionProvider{}, nil, false, nil, db.ConnectionInfo{})
 	users := &testUsers{
 		org:      org,
 		admin:    mustLogin(t, authService, org.ID, "admin@test.local", auth.RoleAdmin),
