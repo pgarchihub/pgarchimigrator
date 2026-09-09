@@ -59,7 +59,7 @@ not just documented as "should work."
   giving a safety margin.
 - **PostgreSQL 19+**: not blocked, but not yet validated by this
   project's own CI either — the web dashboard shows a "newer than
-  tested" note if you connect to one (see `internal/db.ClassifyVersion`).
+  tested" note if you connect to one (see `engines/postgresql/db.ClassifyVersion`).
   PostgreSQL's own query planner has, in this project's own testing
   history, occasionally behaved differently than expected even between
   versions well within the previously-tested range — "probably fine" is
@@ -71,15 +71,15 @@ not just documented as "should work."
 |---|---|---|
 | `cmd/pgarchimigrator` | 5 (Interface: CLI + REST API) | Binary entry point, Cobra commands |
 | `internal/config` | 5, 6 | Configuration loading (env, yaml), preflight settings |
-| `internal/db` | 3.2, 6 | pgx connection pool, TLS, minimal privilege checks |
+| `engines/postgresql/db` | 3.2, 6 | pgx connection pool, TLS, minimal privilege checks |
 | `internal/strategy` | 4.0 (Strategy Decision Matrix) | Operation type + table size → strategy decision |
-| `internal/typecompat` | 4.0 (extension) | Automatic type-cast compatibility detection for `ALTER_COLUMN_TYPE` |
+| `engines/postgresql/typecompat` | 4.0 (extension) | Automatic type-cast compatibility detection for `ALTER_COLUMN_TYPE` |
 | `internal/orchestrator` | 3.1 | Orchestration Engine: State Manager + Step Executor |
-| `internal/ddlflow` | 4.0 rows 1-4 | Direct DDL / Expand & Backfill flow (10 of the 12 operation types; `ALTER_COLUMN_TYPE` and `PARTITION_TABLE` route here only when the table/change is small enough not to need Shadow Table) |
-| `internal/shadowflow` | 4.1, 4.3 | Shadow Table + Logical Replication flow — `ALTER_COLUMN_TYPE` (incompatible casts) and `PARTITION_TABLE` (always, at any table size — see `strategy.OpPartitionTable`'s own doc comment for why) |
-| `internal/preview` | (extension) | Dry-run: strategy + SQL + read-only pre-flight warnings, no DB writes |
-| `internal/monitor` | 3.3 | Performance Monitor, Lock Detector (throttle signals) |
-| `internal/reaper` | 3.3 (Orphan Resource Reaper) | Cleanup of orphaned slots/shadow tables/triggers |
+| `engines/postgresql/ddlflow` | 4.0 rows 1-4 | Direct DDL / Expand & Backfill flow (10 of the 12 operation types; `ALTER_COLUMN_TYPE` and `PARTITION_TABLE` route here only when the table/change is small enough not to need Shadow Table) |
+| `engines/postgresql/shadowflow` | 4.1, 4.3 | Shadow Table + Logical Replication flow — `ALTER_COLUMN_TYPE` (incompatible casts) and `PARTITION_TABLE` (always, at any table size — see `strategy.OpPartitionTable`'s own doc comment for why) |
+| `engines/postgresql/preview` | (extension) | Dry-run: strategy + SQL + read-only pre-flight warnings, no DB writes |
+| `engines/postgresql/monitor` | 3.3 | Performance Monitor, Lock Detector (throttle signals) |
+| `engines/postgresql/reaper` | 3.3 (Orphan Resource Reaper) | Cleanup of orphaned slots/shadow tables/triggers |
 | `internal/state` | 3.1, 5.1 | Checkpoint Store (SQLite, single-instance) |
 | `internal/auth` | (extension) | Product-agnostic org/user/session/RBAC layer |
 | `internal/auditlog` | 3.3, 6 | JSON audit log writer |
@@ -172,7 +172,7 @@ Most packages need the dev PostgreSQL instances running (step 1 above):
 
 ```bash
 go test ./...                                    # unit tests, no DB needed
-go test ./internal/ddlflow/... -tags=integration -v   # and similarly for
+go test ./engines/postgresql/ddlflow/... -tags=integration -v   # and similarly for
                                                         # internal/{reaper,shadowflow,preview,typecompat,catalog,db}
 ```
 
@@ -238,7 +238,7 @@ go run ./cmd/loadtest run \
 e.g. an incompatible `ALTER_COLUMN_TYPE`) needs `--strategy-override`
 to test reliably — the server otherwise decides DIRECT_DDL vs
 SHADOW_TABLE automatically based on whether the old/new types are
-compatible (see `internal/typecompat`), which isn't always obvious from
+compatible (see `engines/postgresql/typecompat`), which isn't always obvious from
 the column types alone:
 
 ```bash

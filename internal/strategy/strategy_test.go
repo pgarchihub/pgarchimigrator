@@ -84,7 +84,7 @@ func TestDecide_UserOverride_IsRespected(t *testing.T) {
 // TestDecide_UserOverride_RejectsOperationStrategyMismatch is the direct
 // regression test for a real bug found via manual testing: forcing
 // ADD_INDEX through SHADOW_TABLE used to be silently accepted, then
-// silently did nothing useful (internal/shadowflow has no ADD_INDEX
+// silently did nothing useful (engines/postgresql/shadowflow has no ADD_INDEX
 // logic at all — it just copied the whole table via CREATE TABLE ...
 // LIKE ... INCLUDING ALL, replicated everything, and swapped for an
 // unchanged copy, reporting COMPLETED without ever creating the

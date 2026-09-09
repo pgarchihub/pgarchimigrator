@@ -7,10 +7,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/pgarchihub/pgarchimigrator/internal/db"
-	"github.com/pgarchihub/pgarchimigrator/internal/ddlflow"
-	"github.com/pgarchihub/pgarchimigrator/internal/progress"
-	"github.com/pgarchihub/pgarchimigrator/internal/shadowflow"
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/db"
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/ddlflow"
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/progress"
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/shadowflow"
 	"github.com/pgarchihub/pgarchimigrator/internal/state"
 )
 
@@ -22,10 +22,10 @@ import (
 //
 // Why this exists — found the hard way, via a real incident during this
 // project's own development: a failed SHADOW_TABLE migration left an
-// orphaned shadow table behind that internal/reaper could never clean
+// orphaned shadow table behind that engines/postgresql/reaper could never clean
 // up (a sequence had been transferred to it during Preparation, and the
 // plain DROP TABLE in failAndCleanup kept failing on a real PostgreSQL
-// dependency error — see internal/shadowflow's RevertSequenceOwnership
+// dependency error — see engines/postgresql/shadowflow's RevertSequenceOwnership
 // doc comment for the full story, now fixed). The orphan sat there,
 // completely invisible, until it was found by manually querying
 // pg_tables with a psql client — nothing in this project's own UI or API
@@ -91,10 +91,10 @@ func (s *Server) shadowTableResourceStatus(ctx context.Context, job *state.Job) 
 
 func (s *Server) backfillResourceStatus(ctx context.Context, job *state.Job) []progress.ResourceStatus {
 	// The exact index name isn't persisted on the job (see
-	// backfillIndexName's own doc comment in internal/ddlflow — it's
+	// backfillIndexName's own doc comment in engines/postgresql/ddlflow — it's
 	// fully derivable from job.ColumnName + job.ID, so it never needed a
 	// dedicated field), so this matches by prefix — the same pattern
-	// internal/reaper's own cleanup already uses to find one.
+	// engines/postgresql/reaper's own cleanup already uses to find one.
 	var indexName string
 	err := s.Pool.QueryRow(ctx,
 		`SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = $2 AND indexname LIKE $3 LIMIT 1`,

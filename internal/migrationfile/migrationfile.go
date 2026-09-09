@@ -118,8 +118,8 @@ func (m MigrationFile) ToMigrationRequest(actor string) (orchestrator.MigrationR
 	// PARTITION_TABLE's bounds may be specified explicitly, or via
 	// ExpandPartitionRule's rule-based shortcut (RANGE only) — see
 	// MigrationFile.PartitionInterval's own doc comment. Expanded here,
-	// before construction, so internal/orchestrator/internal/ddlflow/
-	// internal/shadowflow only ever see the final, explicit bounds —
+	// before construction, so internal/orchestrator/engines/postgresql/ddlflow/
+	// engines/postgresql/shadowflow only ever see the final, explicit bounds —
 	// same reasoning as internal/api's identical handling.
 	var partitionBoundsJSON string
 	if strategy.Operation(m.Operation) == strategy.OpPartitionTable {

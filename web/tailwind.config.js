@@ -33,7 +33,7 @@ export default {
         },
         // Coral/red — reserved STRICTLY for destructive warnings, matching
         // the backend's own Warnings-vs-Notes distinction in
-        // internal/preview.Report. Never used decoratively.
+        // engines/postgresql/preview.Report. Never used decoratively.
         coral: {
           50: "#fdeeec",
           100: "#f9d2cc",

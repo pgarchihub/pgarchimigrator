@@ -6,8 +6,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/upgrade"
 	"github.com/pgarchihub/pgarchimigrator/internal/entitlement"
-	"github.com/pgarchihub/pgarchimigrator/internal/upgrade"
 )
 
 // fakeUpgradeStore is a minimal in-memory upgrade.Store — mirrors

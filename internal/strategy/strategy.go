@@ -21,7 +21,7 @@ const (
 	// zero-downtime primitive for indexes, so neither operation needs the
 	// Expand&Backfill or Shadow Table machinery this package built for
 	// column changes. Both always resolve to StrategyDirectDDL below —
-	// see internal/ddlflow.executeAddIndex/executeDropIndex for why that
+	// see engines/postgresql/ddlflow.executeAddIndex/executeDropIndex for why that
 	// strategy name means "no shadow-table replication needed" here, not
 	// literally "instant" (CONCURRENTLY index builds can take real time on
 	// large tables, just without blocking writes while they do).
@@ -49,7 +49,7 @@ const (
 	// pattern: add a new column under the new name, keep both columns in
 	// sync with a trigger, backfill existing data, and land in a
 	// "dual-write" state where EITHER name works. See
-	// internal/ddlflow.executeRenameColumn's doc comment for the full
+	// engines/postgresql/ddlflow.executeRenameColumn's doc comment for the full
 	// mechanism, and for why finishing the rename (dropping the old name)
 	// is a deliberate, separate, later DROP_COLUMN migration rather than
 	// something this operation does automatically.
@@ -65,7 +65,7 @@ const (
 	// table reference the table name, where a column rename might only
 	// break queries touching that one column. Instead this renames the
 	// table and leaves a compatibility VIEW under the OLD name selecting
-	// from the new one — see internal/ddlflow.executeRenameTable's doc
+	// from the new one — see engines/postgresql/ddlflow.executeRenameTable's doc
 	// comment for why a plain "SELECT * FROM new_table" view is both
 	// sufficient and, for the common case, automatically read/write
 	// updatable by PostgreSQL itself with no extra machinery needed.
@@ -78,7 +78,7 @@ const (
 	// pattern as OpAddConstraint above — PostgreSQL supports this for
 	// foreign keys too, not just CHECK constraints, so this gets the
 	// exact same "instant to add, non-blocking to validate" treatment.
-	// See internal/ddlflow.executeAddForeignKey's doc comment for the
+	// See engines/postgresql/ddlflow.executeAddForeignKey's doc comment for the
 	// full mechanism and for why the referenced column's own
 	// UNIQUE/PRIMARY KEY requirement doesn't need separate validation
 	// here — PostgreSQL enforces it natively with a clear error if it's
@@ -90,7 +90,7 @@ const (
 	// requires computing (and storing) every existing row's value for a
 	// GENERATED ALWAYS AS (...) STORED column, which is a full table
 	// rewrite under ACCESS EXCLUSIVE regardless of how "simple" the
-	// expression is. See internal/ddlflow.executeAddGeneratedColumn's
+	// expression is. See engines/postgresql/ddlflow.executeAddGeneratedColumn's
 	// own doc comment for the two-path mechanism this uses to avoid
 	// that rewrite on a large table: a real, native GENERATED column on
 	// a small table (where the rewrite is cheap enough not to matter —
@@ -108,7 +108,7 @@ const (
 	// table via ALTER. This is why OpPartitionTable is the one
 	// operation outside ALTER_COLUMN_TYPE's incompatible-cast case that
 	// can require StrategyShadowTable — see
-	// internal/shadowflow.prepare's own doc comment for the mechanism:
+	// engines/postgresql/shadowflow.prepare's own doc comment for the mechanism:
 	// a NEW, genuinely partitioned table is built alongside the
 	// original, kept in sync via the same logical-replication pipeline
 	// SHADOW_TABLE already uses for ALTER_COLUMN_TYPE, then swapped in
@@ -154,7 +154,7 @@ type ColumnChange struct {
 
 	// IndexName is used by ADD_INDEX/DROP_INDEX. For ADD_INDEX, an empty
 	// value falls back to an auto-generated name (see
-	// internal/ddlflow.defaultIndexName); for DROP_INDEX it is required —
+	// engines/postgresql/ddlflow.defaultIndexName); for DROP_INDEX it is required —
 	// there's no column-based default to fall back to when dropping.
 	IndexName string
 
@@ -225,7 +225,7 @@ type ColumnChange struct {
 	// time a request reaches this struct, REGARDLESS of whether the
 	// caller originally specified them explicitly or via the
 	// convenience rule-based generator (see ExpandPartitionRule) — a
-	// deliberate design choice so internal/ddlflow/internal/shadowflow
+	// deliberate design choice so engines/postgresql/ddlflow/engines/postgresql/shadowflow
 	// never need to know "rules" exist at all, only ever handling one,
 	// simpler, already-expanded shape. Each element has the shape
 	// {"name": "...", "from": "...", "to": "..."} for RANGE or
@@ -278,7 +278,7 @@ const smallTableRowThreshold = 1_000_000 // FR-01: < 1M rows -> small table
 // PRIMARY KEY precondition, never whether the requested strategy's flow
 // actually knows how to perform this operation at all). Forcing
 // ADD_INDEX through SHADOW_TABLE, for example, silently did nothing
-// useful: internal/shadowflow has no ADD_INDEX-specific logic anywhere,
+// useful: engines/postgresql/shadowflow has no ADD_INDEX-specific logic anywhere,
 // so it just copied the entire table via CREATE TABLE ... LIKE ...
 // INCLUDING ALL (missing the not-yet-existing new index by definition),
 // replicated all 10M+ rows via logical replication (minutes of

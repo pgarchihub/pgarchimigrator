@@ -6,15 +6,15 @@ import (
 	"log"
 	"time"
 
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/upgrade"
 	"github.com/pgarchihub/pgarchimigrator/internal/entitlement"
-	"github.com/pgarchihub/pgarchimigrator/internal/upgrade"
 )
 
 // UpgradeStore wraps a real upgrade.Store and publishes an ecosystem
-// Envelope after Job-level lifecycle transitions — the internal/upgrade
+// Envelope after Job-level lifecycle transitions — the engines/postgresql/upgrade
 // analog of Store (which does the identical thing for state.Store),
 // same decorator pattern, same "the wrapped flow is completely unaware
-// this exists" property: internal/upgrade.Flow already calls
+// this exists" property: engines/postgresql/upgrade.Flow already calls
 // f.Store.CreateJob/UpdateJobPhase/UpdateJobPhaseWithError for every
 // upgrade, exactly as it did before this type existed.
 //
@@ -128,7 +128,7 @@ func (s *UpgradeStore) publishPhaseChanged(ctx context.Context, job *upgrade.Job
 // publish mirrors Store.publish's own envelope-construction logic
 // exactly, adapted for upgrade.Job's own (correlation-context-free)
 // shape — see upgrade.Job's own fields: unlike state.Job, it carries no
-// CorrelationID/CausationID/LifecycleID, since internal/upgrade isn't
+// CorrelationID/CausationID/LifecycleID, since engines/postgresql/upgrade isn't
 // yet reachable through any ecosystem-initiated (OAuth2/202-pattern)
 // endpoint the way POST /api/v1/migrations is — see
 // docs/ecosystem/ARCHITECTURE.md's own "What's next" list. Every

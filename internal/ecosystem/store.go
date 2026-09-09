@@ -12,8 +12,8 @@ import (
 
 // Store wraps a real state.Store and publishes an ecosystem Envelope
 // after every state-mutating call that corresponds to a lifecycle
-// moment the Archi ecosystem cares about — WITHOUT internal/ddlflow or
-// internal/shadowflow needing a single line of new code. Those packages
+// moment the Archi ecosystem cares about — WITHOUT engines/postgresql/ddlflow or
+// engines/postgresql/shadowflow needing a single line of new code. Those packages
 // already call f.Store.Create/UpdatePhase/UpdatePhaseWithError for
 // every migration, exactly as they did before this package existed;
 // wiring pgArchiMigrator into the ecosystem is entirely a matter of

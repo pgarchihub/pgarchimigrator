@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pgarchihub/pgarchimigrator/internal/db"
-	"github.com/pgarchihub/pgarchimigrator/internal/progress"
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/db"
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/progress"
 )
 
 // minSignificantLagChangeBytes is the floor below which a lag change is
@@ -147,7 +147,7 @@ func (s *Server) attachReplicationLag(ctx context.Context, report *progress.Repo
 	if report.Terminal {
 		// The migration is done (success, failure, or aborted) — the
 		// slot is either already cleaned up or on its way out via
-		// internal/reaper; either way, stop tracking this job so
+		// engines/postgresql/reaper; either way, stop tracking this job so
 		// lagTracker's maps don't hold it forever.
 		s.lagTracker.forget(report.JobID)
 		return

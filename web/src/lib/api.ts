@@ -197,7 +197,7 @@ export const api = {
     }),
 
   // --- Catalog browsing (New Migration screen's schema/table/column
-  // dropdowns) — see internal/catalog's package doc comment. ---
+  // dropdowns) — see engines/postgresql/catalog's package doc comment. ---
   listSchemas: () => request<string[]>("/api/schemas"),
   listTables: (schema: string) => request<string[]>(`/api/schemas/${encodeURIComponent(schema)}/tables`),
   listColumns: (schema: string, table: string) =>
@@ -215,14 +215,14 @@ export const api = {
   // write load" step is explicitly triggered, never automatically.
   estimateWriteLoad: () => request<WriteLoadEstimate>("/api/migrations/estimate-write-load", { method: "POST" }),
 
-  // --- Upgrades (internal/upgrade — whole-database PostgreSQL
+  // --- Upgrades (engines/postgresql/upgrade — whole-database PostgreSQL
   // major-version upgrades, distinct from the single-table migrations
   // above) ---
   listUpgrades: () => request<UpgradeJob[]>("/api/upgrades"),
   getUpgrade: (id: string) => request<UpgradeDetail>(`/api/upgrades/${encodeURIComponent(id)}`),
   // Returns immediately (202 Accepted, internal/api's own
   // operationAcceptedResponse shape) — unlike startMigration above,
-  // this does NOT wait for the operation to finish; internal/upgrade.Flow
+  // this does NOT wait for the operation to finish; engines/postgresql/upgrade.Flow
   // runs in the background for what can genuinely be hours. The caller
   // is expected to navigate to the returned id's own detail page and
   // let that screen's own polling (see UpgradeDetail.tsx) show live

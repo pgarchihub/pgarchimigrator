@@ -16,14 +16,14 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/progress"
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/shadowflow"
 	"github.com/pgarchihub/pgarchimigrator/internal/api"
-	"github.com/pgarchihub/pgarchimigrator/internal/progress"
-	"github.com/pgarchihub/pgarchimigrator/internal/shadowflow"
 	"github.com/pgarchihub/pgarchimigrator/internal/state"
 )
 
 // quoteIdentForResourceStatusTest mirrors the same minimal identifier
-// escaping used throughout this project (see e.g. internal/ddlflow's
+// escaping used throughout this project (see e.g. engines/postgresql/ddlflow's
 // quoteIdent) — needed here because job IDs in these tests contain
 // hyphens (invalid in an unquoted PostgreSQL identifier), and the
 // resource names shadowflow.ResourceNames derives from them can inherit
@@ -201,7 +201,7 @@ func TestHandleGetMigration_ResourceStatus_NonTerminalJob_NotEnriched(t *testing
 
 // TestHandleGetMigration_ResourceStatus_EXPANDBACKFILL_DetectsLeftoverIndex
 // covers the other strategy attachResourceStatus checks — a lingering
-// temporary backfill index (see internal/ddlflow's createBackfillIndex
+// temporary backfill index (see engines/postgresql/ddlflow's createBackfillIndex
 // doc comment for what this index is and why a leftover one is worth
 // flagging) reported by name, matched by prefix since the exact name
 // isn't persisted on the job.

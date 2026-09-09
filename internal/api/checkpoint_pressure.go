@@ -4,8 +4,8 @@ import (
 	"context"
 	"log"
 
-	"github.com/pgarchihub/pgarchimigrator/internal/db"
-	"github.com/pgarchihub/pgarchimigrator/internal/progress"
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/db"
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/progress"
 )
 
 // attachCheckpointPressure enriches report in place with a live

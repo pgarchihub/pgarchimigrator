@@ -396,7 +396,7 @@ func (s *SQLiteStore) Get(ctx context.Context, jobID string) (*Job, error) {
 // could mark a successful migration ABORTED instead of COMPLETED, and
 // leak its temp table besides (ScanOnce doesn't know about temp tables at
 // all — only ShadowTableName/ReplicationSlotName are persisted; see the
-// design note in internal/shadowflow's resourceNamesFor).
+// design note in engines/postgresql/shadowflow's resourceNamesFor).
 func (s *SQLiteStore) ListStale(ctx context.Context, olderThan time.Duration) ([]*Job, error) {
 	cutoff := time.Now().UTC().Add(-olderThan).Format(timeLayout)
 

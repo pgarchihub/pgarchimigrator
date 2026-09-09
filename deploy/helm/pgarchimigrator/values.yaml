@@ -18,7 +18,7 @@ service:
 
 # Persistent storage for the SQLite state database and JSON Lines audit
 # log (both under /data in the container). This MUST survive pod
-# restarts/rescheduling — losing it means internal/reaper can no longer
+# restarts/rescheduling — losing it means engines/postgresql/reaper can no longer
 # find and clean up in-flight migrations' PostgreSQL-side resources
 # (replication slots, shadow tables), and in-progress jobs become
 # unrecoverable orphans.
@@ -49,7 +49,7 @@ database:
 actor: "k8s-deployment"
 
 # Corresponds to `pgarchimigrator serve --auto-sweep` (default true): runs
-# internal/reaper's periodic orphan-cleanup + rollback-window-completion
+# engines/postgresql/reaper's periodic orphan-cleanup + rollback-window-completion
 # loop in the background alongside the API server.
 autoSweep: true
 

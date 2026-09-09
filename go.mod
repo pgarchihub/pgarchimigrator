@@ -12,8 +12,8 @@ require (
 	modernc.org/sqlite v1.29.5
 )
 
-// NOTE: github.com/jackc/pglogrepl is used by internal/shadowflow/decoder.go
-// and internal/shadowflow/replication.go but is deliberately NOT pinned to a
+// NOTE: github.com/jackc/pglogrepl is used by engines/postgresql/shadowflow/decoder.go
+// and engines/postgresql/shadowflow/replication.go but is deliberately NOT pinned to a
 // specific version here — guessing a pseudo-version string risks an
 // unresolvable "unknown revision" error that this sandboxed environment
 // cannot verify against the real module proxy. Run `go mod tidy` (or

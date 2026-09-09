@@ -1,5 +1,5 @@
-// Mirrors internal/api's JSON shapes exactly — see internal/progress.Report,
-// internal/preview.Report, and internal/api/server.go's request/response
+// Mirrors internal/api's JSON shapes exactly — see engines/postgresql/progress.Report,
+// engines/postgresql/preview.Report, and internal/api/server.go's request/response
 // structs. Keep these in sync manually; there is no code generation step
 // (yet) between the Go backend and this TypeScript client.
 
@@ -52,7 +52,7 @@ export interface WriteLoadEstimate {
   caution: boolean;
 }
 
-// Mirrors internal/progress.Analytics/StrategyStats — computed entirely
+// Mirrors engines/postgresql/progress.Analytics/StrategyStats — computed entirely
 // from existing job records server-side (no new database queries
 // against the target PostgreSQL server), served by GET /api/analytics.
 export interface StrategyStats {
@@ -71,7 +71,7 @@ export interface Analytics {
 
 export interface StageView {
   Phase: Phase;
-  // Mirrors internal/progress's StageStatus constants exactly —
+  // Mirrors engines/postgresql/progress's StageStatus constants exactly —
   // "DONE"/"CURRENT"/"PENDING", uppercase. A prior version of this type
   // declared these lowercase, which silently never matched the real
   // backend values: every comparison against it fell through to the
@@ -85,7 +85,7 @@ export interface StageView {
   Status: "DONE" | "CURRENT" | "PENDING";
 }
 
-// Mirrors internal/progress.Report. CreatedAt/UpdatedAt are Go time.Time
+// Mirrors engines/postgresql/progress.Report. CreatedAt/UpdatedAt are Go time.Time
 // values, which encoding/json serializes as RFC3339 strings — kept as
 // `string` here and parsed with `new Date(...)` at the point of use
 // rather than eagerly, since a zero time.Time (e.g. a field genuinely
@@ -154,7 +154,7 @@ export interface MigrationReport {
   ImpactPeakQueryDurationSeconds?: number;
 }
 
-// Mirrors internal/progress.ResourceStatus — a LIVE, directly-verified
+// Mirrors engines/postgresql/progress.ResourceStatus — a LIVE, directly-verified
 // check, not a log entry. See MigrationReport.ResourceStatus's own doc
 // comment for when this is populated.
 export interface ResourceStatus {
@@ -163,7 +163,7 @@ export interface ResourceStatus {
   exists: boolean;
 }
 
-// Mirrors internal/preview.Report.
+// Mirrors engines/postgresql/preview.Report.
 export interface PreviewReport {
   SchemaName: string;
   TableName: string;
@@ -226,7 +226,7 @@ export interface ManagedUser {
   role: Role;
 }
 
-// Mirrors internal/catalog.ColumnInfo.
+// Mirrors engines/postgresql/catalog.ColumnInfo.
 export interface ColumnInfo {
   Name: string;
   Type: string;
@@ -245,13 +245,13 @@ export interface TableStats {
   ReplicaIdentity: string;
 }
 
-// Mirrors internal/catalog.SampleRowsResult.
+// Mirrors engines/postgresql/catalog.SampleRowsResult.
 export interface SampleRowsResult {
   Columns: string[];
   Rows: string[][];
 }
 
-// Mirrors internal/db.ConnectionInfo — deliberately has no password
+// Mirrors engines/postgresql/db.ConnectionInfo — deliberately has no password
 // field, see that type's own doc comment for why.
 export interface ConnectionInfo {
   Host: string;
@@ -263,9 +263,9 @@ export interface ConnectionInfo {
   // fields.
   PostgresVersion: number;
   PostgresVersionString: string;
-  // Mirrors internal/db.VersionSupportStatus's exact string values —
+  // Mirrors engines/postgresql/db.VersionSupportStatus's exact string values —
   // "" (unknown), "below_minimum", "supported", "newer_than_tested".
-  // Computed server-side (see internal/db.ClassifyVersion) so this
+  // Computed server-side (see engines/postgresql/db.ClassifyVersion) so this
   // screen never needs to duplicate the supported-version thresholds
   // itself.
   VersionSupportStatus: "" | "below_minimum" | "supported" | "newer_than_tested";
@@ -275,7 +275,7 @@ export interface SetupRequiredResponse {
   required: boolean;
 }
 
-// Mirrors internal/upgrade.Phase's exact string values — deliberately a
+// Mirrors engines/postgresql/upgrade.Phase's exact string values — deliberately a
 // DIFFERENT set from MigrationReport's own CurrentPhase (see that Go
 // package's own doc comment: an upgrade's real stages don't map onto a
 // single migration's, there's no SWAPPING/ROLLBACK_WINDOW equivalent
@@ -289,7 +289,7 @@ export type UpgradePhase =
   | "FAILED"
   | "ABORTED";
 
-// Mirrors internal/upgrade.Job — note this has NO JSON tags on the Go
+// Mirrors engines/postgresql/upgrade.Job — note this has NO JSON tags on the Go
 // side (see that struct's own field list), so field names arrive
 // exactly as Go wrote them (PascalCase), unlike most of this file's
 // other types.
@@ -300,7 +300,7 @@ export interface UpgradeJob {
   SourceConnectionRef: string;
   TargetConnectionRef: string;
   // SourceReplicationRef/Tables were added to the Go struct after
-  // UpgradeJob was first written here — see internal/upgrade.Job's own
+  // UpgradeJob was first written here — see engines/postgresql/upgrade.Job's own
   // doc comments for SourceReplicationRef (the replication-specific
   // override) and Tables (explicit table-level scoping). Both are
   // empty/null for a job that never used the "Advanced" override or
@@ -315,7 +315,7 @@ export interface UpgradeJob {
   TablesVerified: number;
 }
 
-// Mirrors internal/upgrade.Table — same "no JSON tags, PascalCase"
+// Mirrors engines/postgresql/upgrade.Table — same "no JSON tags, PascalCase"
 // note as UpgradeJob above.
 export interface UpgradeTable {
   JobID: string;
@@ -334,7 +334,7 @@ export interface UpgradeDetail extends UpgradeJob {
   tables: UpgradeTable[] | null;
 }
 
-// Mirrors internal/upgrade.TableRef's own json tags (schema/table).
+// Mirrors engines/postgresql/upgrade.TableRef's own json tags (schema/table).
 export interface TableRef {
   schema: string;
   table: string;
@@ -357,7 +357,7 @@ export interface StartUpgradeRequest {
   sourceDsn: string;
   targetDsn: string;
   schemas?: string[];
-  // Optional — see internal/upgrade.Job.SourceReplicationRef's own doc
+  // Optional — see engines/postgresql/upgrade.Job.SourceReplicationRef's own doc
   // comment for exactly when this differs from sourceDsn: whenever this
   // server process and the TARGET instance's own PostgreSQL server have
   // a different network view of the source (e.g. a Docker Compose test
@@ -365,7 +365,7 @@ export interface StartUpgradeRequest {
   // the target container must use the Compose network's own hostname).
   sourceReplicationDsn?: string;
   // Optional, explicit table-level scoping — mutually exclusive with
-  // schemas (see internal/upgrade.Job.Tables' own doc comment): the
+  // schemas (see engines/postgresql/upgrade.Job.Tables' own doc comment): the
   // checkbox picker always sends one or the other, never both.
   tables?: TableRef[];
 }

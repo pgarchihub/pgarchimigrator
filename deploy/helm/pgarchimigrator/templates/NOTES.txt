@@ -39,5 +39,5 @@ credentials it contains and switch to database.existingSecret instead.
 4. Persistent state lives on the StatefulSet's PVC
    (data-{{ include "pgarchimigrator.fullname" . }}-0). Back this volume
    up like you would any other stateful workload's data — losing it means
-   internal/reaper can no longer find and clean up any migrations that
+   engines/postgresql/reaper can no longer find and clean up any migrations that
    were in flight.

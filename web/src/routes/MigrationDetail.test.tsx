@@ -297,7 +297,7 @@ describe("MigrationDetail — affected records and step list", () => {
 
 // This suite is a direct regression guard for a real, user-reported bug:
 // a FAILED/ABORTED job's terminal stage is deliberately marked "CURRENT"
-// server-side (see internal/progress.Compute's early-return path) purely
+// server-side (see engines/postgresql/progress.Compute's early-return path) purely
 // so PhaseTrack's graphic highlights where things stopped — but the
 // step list's naive "CURRENT" -> "In progress" mapping took that
 // literally, showing "In progress" for a migration that had, in fact,
@@ -687,7 +687,7 @@ describe("MigrationDetail — does not crash on a null Statements field", () => 
 
   // Direct regression test for the backend fix accompanying this: an
   // ADD_INDEX migration now gets its own explicit VALIDATING stage (see
-  // internal/progress's pipelineFor and internal/ddlflow's
+  // engines/postgresql/progress's pipelineFor and engines/postgresql/ddlflow's
   // executeAddIndex), surfacing the index-validity check it already
   // enforced internally — this confirms the Health Card picks that up
   // automatically, with zero ADD_INDEX-specific frontend logic needed.
@@ -776,8 +776,8 @@ describe("MigrationDetail — does not crash on a null Statements field", () => 
   // Regression test for a real, user-reported crash: a Go nil slice
   // marshals to JSON `null`, and this screen used to do
   // `job.Statements.length` unconditionally — this exact bug was already
-  // found and fixed once in internal/preview.Generate, then reintroduced
-  // in internal/progress.describeOperation's SHADOW_TABLE/default
+  // found and fixed once in engines/postgresql/preview.Generate, then reintroduced
+  // in engines/postgresql/progress.describeOperation's SHADOW_TABLE/default
   // branches (both now fixed to return []string{} instead of nil). This
   // test guards the FRONTEND side: even if a backend regression ever
   // reintroduces a nil Statements value, the screen should degrade

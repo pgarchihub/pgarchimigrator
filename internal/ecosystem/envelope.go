@@ -6,8 +6,8 @@
 //
 // This package is deliberately isolated from every other internal
 // package except internal/state (read-only, for Job field access) and
-// internal/entitlement (to decide event granularity) — internal/ddlflow
-// and internal/shadowflow have ZERO awareness this package exists. See
+// internal/entitlement (to decide event granularity) — engines/postgresql/ddlflow
+// and engines/postgresql/shadowflow have ZERO awareness this package exists. See
 // Store's own doc comment for how events actually get published without
 // either of those packages needing a single new line of code.
 package ecosystem
@@ -136,10 +136,10 @@ type Trace struct {
 // by hand.
 const ResourceTypeMigrationJob = "migration.postgresql.job"
 
-// ResourceTypeUpgradeJob is internal/upgrade's own resource type — a
+// ResourceTypeUpgradeJob is engines/postgresql/upgrade's own resource type — a
 // distinct resource from ResourceTypeMigrationJob above, matching that
 // package's own "separate Job, not shoehorned into state.Job" design
-// (see internal/upgrade's package doc comment). Also matches
+// (see engines/postgresql/upgrade's package doc comment). Also matches
 // archi-product-manifest.yaml's own resourceTypes entry for the
 // migration.postgresql.database.upgrade capability — same "both must
 // reference the same idea" caution as ResourceTypeMigrationJob's own

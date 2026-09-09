@@ -29,7 +29,7 @@ const (
 )
 
 // Job represents the checkpoint record of a single migration.
-// The Reaper (internal/reaper) scans for FAILED/ABORTED jobs, or
+// The Reaper (engines/postgresql/reaper) scans for FAILED/ABORTED jobs, or
 // IN_PROGRESS jobs whose last update is older than N minutes, through this
 // struct.
 type Job struct {
@@ -56,8 +56,8 @@ type Job struct {
 	Name        string
 	Description string
 
-	// The fields below carry the operation details needed by internal/ddlflow
-	// and internal/shadowflow to resume a job from its checkpoint (the
+	// The fields below carry the operation details needed by engines/postgresql/ddlflow
+	// and engines/postgresql/shadowflow to resume a job from its checkpoint (the
 	// primitive/string counterparts of strategy.Operation/ColumnChange;
 	// again kept as string/primitive types here to avoid a circular import).
 	Operation         string // e.g. "ADD_COLUMN", "ALTER_COLUMN_TYPE" (see internal/strategy.Operation)
@@ -66,7 +66,7 @@ type Job struct {
 	DefaultValue      string // empty means "no default"
 	IsVolatileDefault bool   // true triggers the Expand & Backfill flow (see Architecture Doc 4.0)
 
-	// DeprecatedColumnName is used ONLY by internal/ddlflow's DROP_COLUMN
+	// DeprecatedColumnName is used ONLY by engines/postgresql/ddlflow's DROP_COLUMN
 	// two-phase flow: once set, it holds the temporary name the original
 	// column was renamed to during the "soft drop" (see
 	// DDLFlow.executeDropColumn). Empty for every other operation.
@@ -168,7 +168,7 @@ type Job struct {
 	// display purposes.
 	EstimatedRowCount int64
 	// RowsProcessed is a running counter of rows touched by a batched
-	// backfill (see internal/ddlflow's backfillLoop and
+	// backfill (see engines/postgresql/ddlflow's backfillLoop and
 	// renameBackfillLoop), incremented after each batch via
 	// Store.IncrementRowsProcessed. Stays 0 for operations that don't
 	// backfill row-by-row (e.g. ADD_INDEX, SET_NOT_NULL) — those apply via
@@ -196,15 +196,15 @@ type Store interface {
 	Create(ctx context.Context, job *Job) error
 	UpdatePhase(ctx context.Context, jobID string, phase Phase) error
 	// UpdatePhaseWithError also persists LastError for jobs transitioning to
-	// FAILED (used by internal/ddlflow, internal/shadowflow).
+	// FAILED (used by engines/postgresql/ddlflow, engines/postgresql/shadowflow).
 	UpdatePhaseWithError(ctx context.Context, jobID string, phase Phase, lastError string) error
 	// UpdateResources persists the replication slot and shadow table names
-	// once internal/shadowflow generates them during Preparation — so
-	// internal/reaper can find and clean them up by name even if the
+	// once engines/postgresql/shadowflow generates them during Preparation — so
+	// engines/postgresql/reaper can find and clean them up by name even if the
 	// process crashes before the job reaches a terminal phase.
 	UpdateResources(ctx context.Context, jobID string, slotName, shadowTableName string) error
 	// UpdateRollbackDeadline persists the FR-08a rollback window deadline
-	// once a swap succeeds (see internal/shadowflow.ShadowFlow.Execute).
+	// once a swap succeeds (see engines/postgresql/shadowflow.ShadowFlow.Execute).
 	UpdateRollbackDeadline(ctx context.Context, jobID string, deadline time.Time) error
 	// UpdateImpactPeak persists the current running peak from
 	// internal/api's impactTracker — see Job.ImpactPeakQueryDurationSeconds's
@@ -229,7 +229,7 @@ type Store interface {
 	UpdateConstraintName(ctx context.Context, jobID string, constraintName string) error
 	// IncrementRowsProcessed adds delta to the job's running RowsProcessed
 	// counter — called after each backfill batch (see
-	// internal/ddlflow.backfillLoop/renameBackfillLoop) rather than
+	// engines/postgresql/ddlflow.backfillLoop/renameBackfillLoop) rather than
 	// overwritten wholesale, since the caller only knows how many rows
 	// THIS batch touched, not the running total.
 	IncrementRowsProcessed(ctx context.Context, jobID string, delta int64) error
@@ -245,7 +245,7 @@ type Store interface {
 	ListAll(ctx context.Context) ([]*Job, error)
 	// ListExpiredRollbackWindows returns jobs currently in
 	// ROLLBACK_WINDOW whose RollbackDeadline has passed — used by
-	// internal/reaper to complete the Cleanup step (Architecture Doc
+	// engines/postgresql/reaper to complete the Cleanup step (Architecture Doc
 	// Section 4.1 step 7) for migrations that succeeded but were never
 	// explicitly rolled back within their FR-08a grace period. This is
 	// deliberately a different signal than ListStale: it represents a

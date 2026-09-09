@@ -79,7 +79,7 @@ var dangerousSQLExpressionPattern = regexp.MustCompile(
 // specific) for the dangerous patterns described in
 // dangerousSQLExpressionPattern's own doc comment. See ValidateColumnType's
 // doc comment for why this is enforced at two layers (early rejection in
-// internal/orchestrator, and again at the point internal/ddlflow
+// internal/orchestrator, and again at the point engines/postgresql/ddlflow
 // actually builds DDL from it).
 func ValidateSQLExpression(expr, fieldName string) error {
 	if dangerousSQLExpressionPattern.MatchString(expr) {
@@ -111,7 +111,7 @@ var validOnDeleteActions = map[string]bool{
 // exactly one of these five phrases is rejected outright, not just
 // anything that happens to look dangerous. Empty is valid too — it
 // means PostgreSQL's own default (NO ACTION), not "no ON DELETE clause
-// at all" (see internal/ddlflow.executeAddForeignKey for how an empty
+// at all" (see engines/postgresql/ddlflow.executeAddForeignKey for how an empty
 // value is handled).
 func ValidateOnDeleteAction(action string) error {
 	if action == "" {

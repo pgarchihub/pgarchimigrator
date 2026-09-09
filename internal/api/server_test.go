@@ -12,15 +12,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/db"
+	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/upgrade"
 	"github.com/pgarchihub/pgarchimigrator/internal/api"
 	"github.com/pgarchihub/pgarchimigrator/internal/auth"
-	"github.com/pgarchihub/pgarchimigrator/internal/db"
 	"github.com/pgarchihub/pgarchimigrator/internal/idempotency"
 	"github.com/pgarchihub/pgarchimigrator/internal/orchestrator"
 	"github.com/pgarchihub/pgarchimigrator/internal/serviceauth"
 	"github.com/pgarchihub/pgarchimigrator/internal/state"
 	"github.com/pgarchihub/pgarchimigrator/internal/strategy"
-	"github.com/pgarchihub/pgarchimigrator/internal/upgrade"
 )
 
 // fakeStore is a minimal in-memory state.Store, duplicated here (rather
@@ -192,7 +192,7 @@ func newTestServer(t *testing.T, store *fakeStore, flow *fakeFlow) (*api.Server,
 		t.Fatalf("could not create test organization: %v", err)
 	}
 
-	srv := api.NewServer(orch, store, nil, authService, nil, nil, nil, nil, false, nil, db.ConnectionInfo{}) // nil Reaper: sweep endpoint tested separately; nil pool: preview endpoint needs a real Postgres, tested in internal/preview instead
+	srv := api.NewServer(orch, store, nil, authService, nil, nil, nil, nil, false, nil, db.ConnectionInfo{}) // nil Reaper: sweep endpoint tested separately; nil pool: preview endpoint needs a real Postgres, tested in engines/postgresql/preview instead
 
 	users := &testUsers{
 		org:      org,
@@ -536,7 +536,7 @@ func TestProtectedRoute_NoCookie_Returns401(t *testing.T) {
 // validStrategiesByOperation doc comment): the New Migration screen's
 // strategy override dropdown used to show every strategy regardless of
 // the selected operation, which let ADD_INDEX get silently forced
-// through SHADOW_TABLE — a combination internal/shadowflow has no logic
+// through SHADOW_TABLE — a combination engines/postgresql/shadowflow has no logic
 // for at all, which silently did nothing useful. This confirms the
 // endpoint the frontend now filters that dropdown against actually
 // reflects the same whitelist StartMigration itself enforces (same
@@ -643,9 +643,9 @@ func TestHandleStartMigration_MissingFields_Returns400(t *testing.T) {
 // TestHandlePreviewMigration_MissingFields_Returns400 verifies request
 // validation on the dry-run endpoint — deliberately only the validation
 // path, which is safe to test here since it runs BEFORE
-// internal/preview.Generate is ever called (that function needs a real
+// engines/postgresql/preview.Generate is ever called (that function needs a real
 // PostgreSQL connection, which this pure-unit test suite doesn't have;
-// see internal/preview's own integration tests for the substantive
+// see engines/postgresql/preview's own integration tests for the substantive
 // dry-run behavior — NULL-count warnings, statement previews, etc.).
 func TestHandlePreviewMigration_MissingFields_Returns400(t *testing.T) {
 	srv, users := newTestServer(t, newFakeStore(), &fakeFlow{})
@@ -1480,7 +1480,7 @@ func newTestServerWithUpgrade(t *testing.T) (*api.Server, *testUsers) {
 // here to the cookie-authenticated dashboard surface rather than the
 // OAuth2 one. Does NOT wait for (or assert anything about) the
 // background Flow.Run itself succeeding — that needs a real PostgreSQL
-// pair and is covered by internal/upgrade's own
+// pair and is covered by engines/postgresql/upgrade's own
 // flow_integration_test.go; this test is purely about the HTTP
 // contract: did a job get created and durably persisted, and did the
 // response look right.

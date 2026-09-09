@@ -5,7 +5,7 @@
 # entrypoint only auto-generates a replication rule for loopback addresses
 # (127.0.0.1/::1), which does not cover connections arriving from outside
 # the container via Docker's published port. Without this script,
-# internal/shadowflow's replication-mode connections (decoder.go,
+# engines/postgresql/shadowflow's replication-mode connections (decoder.go,
 # replication.go) would fail with "no pg_hba.conf entry for replication
 # connection" when run against this dev container.
 #

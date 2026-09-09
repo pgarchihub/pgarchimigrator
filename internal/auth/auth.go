@@ -102,7 +102,7 @@ type Store interface {
 	DeleteSession(ctx context.Context, id string) error
 	// DeleteExpiredSessions removes sessions past their ExpiresAt and
 	// returns how many were deleted — intended to be called periodically
-	// (e.g. from the same background loop as internal/reaper) to keep the
+	// (e.g. from the same background loop as engines/postgresql/reaper) to keep the
 	// sessions table from growing unbounded.
 	DeleteExpiredSessions(ctx context.Context) (int64, error)
 }

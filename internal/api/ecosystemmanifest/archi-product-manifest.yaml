@@ -16,7 +16,7 @@
 # an ecosystem consumer asks "can this product migrate a PostgreSQL
 # schema," not "does it support RENAME_TABLE specifically."
 #
-# migration.postgresql.database.upgrade (internal/upgrade — see
+# migration.postgresql.database.upgrade (engines/postgresql/upgrade — see
 # docs/ecosystem/ARCHITECTURE.md's own "PostgreSQL major-version
 # upgrade" section) is stability: beta, not stable — it has a working
 # CLI + cookie-authenticated dashboard API

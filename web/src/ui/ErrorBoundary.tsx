@@ -10,7 +10,7 @@ interface State {
 }
 
 // ErrorBoundary exists because of a real incident: a nil-vs-empty-slice
-// bug in the Go backend (see internal/preview.Generate's fix) made a
+// bug in the Go backend (see engines/postgresql/preview.Generate's fix) made a
 // perfectly normal preview response crash the New Migration screen with
 // "Cannot read properties of null" — and with NOTHING catching that
 // error anywhere in the tree, React's default behavior is to unmount the

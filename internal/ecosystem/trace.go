@@ -37,7 +37,7 @@ type traceContextKey struct{}
 // This is a deliberate scope choice, not an oversight: a traceparent
 // header belongs to the ONE HTTP request that carried it — propagating
 // the same parent span across a job's entire background lifecycle
-// (which internal/ddlflow/internal/shadowflow/internal/upgrade.Flow all
+// (which engines/postgresql/ddlflow/engines/postgresql/shadowflow/engines/postgresql/upgrade.Flow all
 // run under their own context.Background(), specifically so a canceled
 // HTTP request context can't abort a long-running operation — see
 // orchestrator.StartMigrationAsync's own doc comment) wouldn't match

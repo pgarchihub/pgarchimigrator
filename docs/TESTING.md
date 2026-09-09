@@ -43,7 +43,7 @@ developed in:
   the logic is cross-verified in an independent language where
   possible (e.g. Python's `sqlite3` module — see Section 2.2).
 - **Packages with only stdlib dependencies** (`internal/strategy`,
-  `internal/progress`, `internal/entitlement`, `internal/ecosystem` —
+  `engines/postgresql/progress`, `internal/entitlement`, `internal/ecosystem` —
   via `state`/`upgrade`/`entitlement` stubs — the parts of `internal/
   serviceauth` other than `sqlite_store.go`, `internal/
   agentattestation`, `internal/runtimeverify`, `internal/idempotency`
@@ -70,7 +70,7 @@ run with **real `go test`**:
 | Package | Test Count | Notes |
 |---|---|---|
 | `internal/strategy` | 39 | Operation → strategy decision logic |
-| `internal/progress` | 41 | Progress computation, phase display |
+| `engines/postgresql/progress` | 41 | Progress computation, phase display |
 | `internal/entitlement` | 5 | Edition (Community/Enterprise) checks |
 | `internal/ecosystem` | 25 | Event-publishing decorators (`Store`, `UpgradeStore`), `traceparent` |
 | `internal/serviceauth` (excluding SQLite) | 20 | OAuth2 client-credentials logic |
@@ -78,7 +78,7 @@ run with **real `go test`**:
 | `internal/runtimeverify` | 9 | Installed package integrity, path traversal protection |
 | `internal/idempotency` (excluding SQLite) | 8 | Replaying repeated requests |
 | `internal/deploylayout` | 10 | ArchiOrbitLabs directory layout resolution |
-| `internal/upgrade` (excluding SQLite) | 19 | `ConnectionProvider`, `Introspect` helpers |
+| `engines/postgresql/upgrade` (excluding SQLite) | 19 | `ConnectionProvider`, `Introspect` helpers |
 | `cmd/pgarchisign` | 4 | Ed25519 artifact signing/verification |
 
 **How to run** (example, for any package):
@@ -100,8 +100,8 @@ real logic) are created and their import paths rewritten with `sed`.
 ### 3.2. Packages with Heavy Dependencies (Syntax Verification Only)
 
 Packages such as `internal/state`, `internal/auth` (the SQLite
-implementation), `internal/ddlflow`, `internal/shadowflow`,
-`internal/orchestrator`, `internal/api`, `internal/db`,
+implementation), `engines/postgresql/ddlflow`, `engines/postgresql/shadowflow`,
+`internal/orchestrator`, `internal/api`, `engines/postgresql/db`,
 `cmd/pgarchimigrator` depend directly on `modernc.org/sqlite` or
 `github.com/jackc/pgx/v5`, so **real `go test` cannot run** in the
 sandbox. For these packages:
@@ -112,7 +112,7 @@ sandbox. For these packages:
    tests is confirmed to actually exist via `grep` (`gofmt -e` only
    checks syntax, it does **not catch** type/symbol mismatches).
 3. **Cross-language verification of SQLite logic** — for example,
-   `internal/upgrade`'s schema-migration logic (`PRAGMA table_info` →
+   `engines/postgresql/upgrade`'s schema-migration logic (`PRAGMA table_info` →
    conditional `ALTER TABLE`) was **actually run and verified** with
    Python's stdlib `sqlite3` module first, then ported to Go (see
    the internal architecture notes on this).
@@ -122,10 +122,10 @@ sandbox. For these packages:
 | Package | Test Count (runs in CI) |
 |---|---|
 | `internal/auth` | 26 |
-| `internal/ddlflow` | 51 |
+| `engines/postgresql/ddlflow` | 51 |
 | `internal/orchestrator` | 17 |
 | `internal/state` | 12 |
-| `internal/reaper` | 12 |
+| `engines/postgresql/reaper` | 12 |
 | `internal/api` | 120 |
 
 ### 3.3. Integration Tests (`-tags=integration`)
@@ -142,10 +142,10 @@ docker compose -f deploy/docker-compose.dev.yml down -v
 
 | Package | Test Count | Coverage |
 |---|---|---|
-| `internal/shadowflow` | 30 | Shadow-table sync within a single instance |
-| `internal/upgrade` | 9 | Full flow **across two separate** PostgreSQL instances (`pg-logical` ↔ `pg-upgrade-target`) |
+| `engines/postgresql/shadowflow` | 30 | Shadow-table sync within a single instance |
+| `engines/postgresql/upgrade` | 9 | Full flow **across two separate** PostgreSQL instances (`pg-logical` ↔ `pg-upgrade-target`) |
 
-`internal/upgrade`'s integration tests are especially important, since
+`engines/postgresql/upgrade`'s integration tests are especially important, since
 this package uses **real** native PostgreSQL logical replication —
 `TestFlow_Run_EndToEnd_SmallTable` (a real 500-row table, real
 `CREATE SUBSCRIPTION`, real validation) is the **most comprehensive
@@ -404,7 +404,7 @@ indispensable.
   since been built (see Section 6.3's own scenario) — kept here as a
   historical note about how this document evolved alongside the
   feature.
-- **`internal/upgrade`'s ecosystem OAuth2 endpoint** (`POST
+- **`engines/postgresql/upgrade`'s ecosystem OAuth2 endpoint** (`POST
   /api/v1/upgrades`) has been tested in isolation, but never
   **end-to-end** with a real ArchiConsole integration (the ecosystem
   doesn't yet have a consumer actually wired up to this project).

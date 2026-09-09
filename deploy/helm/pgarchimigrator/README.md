@@ -17,7 +17,7 @@ guarantees:
   know about, double-creating or prematurely dropping PostgreSQL-side
   resources (replication slots, shadow tables) out from under an
   in-progress migration.
-- `internal/reaper`'s orphan-cleanup and rollback-window sweeps rely
+- `engines/postgresql/reaper`'s orphan-cleanup and rollback-window sweeps rely
   entirely on what's in the state store — if it's lost, those PostgreSQL
   resources become permanently unrecoverable orphans, not just "the tool
   forgets about a job."
@@ -66,7 +66,7 @@ helm install pgarchimigrator ./deploy/helm/pgarchimigrator \
 | `database.existingSecret.key` | `database-url` | Key within that Secret |
 | `database.inlineDSN` | `""` | Fallback for throwaway testing only — see the warning above |
 | `actor` | `k8s-deployment` | `PGARCHIMIGRATOR_ACTOR` — identifies this deployment in the audit log (TR-07) |
-| `autoSweep` | `true` | Runs `internal/reaper`'s periodic loop in the background (`pgarchimigrator serve --auto-sweep`) |
+| `autoSweep` | `true` | Runs `engines/postgresql/reaper`'s periodic loop in the background (`pgarchimigrator serve --auto-sweep`) |
 | `resources` | `100m/128Mi` requests, `500m/512Mi` limits | Adjust for your migration workload sizes |
 | `serviceAccount.create` | `true` | Whether to create a dedicated ServiceAccount |
 

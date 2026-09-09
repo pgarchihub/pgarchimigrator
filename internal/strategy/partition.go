@@ -29,7 +29,7 @@ const maxGeneratedPartitions = 1000
 // This is a pure function with no database access — the caller (see
 // internal/api's handling of a rule-based PARTITION_TABLE request) is
 // responsible for calling this BEFORE constructing the ColumnChange, so
-// internal/ddlflow/internal/shadowflow only ever see the final,
+// engines/postgresql/ddlflow/engines/postgresql/shadowflow only ever see the final,
 // explicit bounds (see ColumnChange.PartitionBoundsJSON's own doc
 // comment for why).
 func ExpandPartitionRule(interval, from, to, namePrefix string) ([]PartitionBound, error) {

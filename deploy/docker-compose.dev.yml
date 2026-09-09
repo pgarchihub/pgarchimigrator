@@ -76,15 +76,15 @@ services:
     # wal_level and returns a meaningful error (US-05).
 
   pg-upgrade-target:
-    # internal/upgrade's own integration tests (see
-    # internal/upgrade/*_integration_test.go) need a SECOND, separate
+    # engines/postgresql/upgrade's own integration tests (see
+    # engines/postgresql/upgrade/*_integration_test.go) need a SECOND, separate
     # PostgreSQL instance distinct from pg-logical — an upgrade syncs
     # between two different instances, unlike every other integration
-    # test in this repo (internal/shadowflow's own), which syncs within
+    # test in this repo (engines/postgresql/shadowflow's own), which syncs within
     # ONE instance (a shadow table alongside its source table). This
     # image version is deliberately FIXED (not
     # PGARCHIMIGRATOR_TEST_PG_VERSION-controlled like pg-logical/
-    # pg-legacy above) — internal/upgrade's tests are exercising a
+    # pg-legacy above) — engines/postgresql/upgrade's tests are exercising a
     # cross-version sync specifically, so pg-logical and this service
     # should genuinely differ in PostgreSQL major version most of the
     # time; hardcoding a newer version here achieves that without
