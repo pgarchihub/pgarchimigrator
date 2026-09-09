@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/pgarchihub/pgarchimigrator/internal/entitlement"
 	"github.com/pgarchihub/pgarchimigrator/internal/state"
@@ -64,6 +65,61 @@ func (f *fakeStore) UpdatePhase(ctx context.Context, jobID string, phase state.P
 
 func (f *fakeStore) UpdatePhaseWithError(ctx context.Context, jobID string, phase state.Phase, lastError string) error {
 	return f.UpdatePhase(ctx, jobID, phase)
+}
+
+// The methods below exist purely to satisfy state.Store — none of
+// these tests exercise them, so each is a minimal no-op (or, for the
+// List* methods, returns the in-memory jobs the same way ListAll
+// already did before this fake needed the rest of the interface too).
+func (f *fakeStore) UpdateResources(ctx context.Context, jobID string, slotName, shadowTableName string) error {
+	return nil
+}
+
+func (f *fakeStore) UpdateRollbackDeadline(ctx context.Context, jobID string, deadline time.Time) error {
+	return nil
+}
+
+func (f *fakeStore) UpdateImpactPeak(ctx context.Context, jobID string, peakSeconds float64) error {
+	return nil
+}
+
+func (f *fakeStore) UpdateDeprecatedColumnName(ctx context.Context, jobID string, deprecatedName string) error {
+	return nil
+}
+
+func (f *fakeStore) UpdateIndexName(ctx context.Context, jobID string, indexName string) error {
+	return nil
+}
+
+func (f *fakeStore) UpdateIndexDefinition(ctx context.Context, jobID string, definition string) error {
+	return nil
+}
+
+func (f *fakeStore) UpdateConstraintName(ctx context.Context, jobID string, constraintName string) error {
+	return nil
+}
+
+func (f *fakeStore) IncrementRowsProcessed(ctx context.Context, jobID string, delta int64) error {
+	return nil
+}
+
+func (f *fakeStore) ListStale(ctx context.Context, olderThan time.Duration) ([]*state.Job, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) ListAll(ctx context.Context) ([]*state.Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var jobs []*state.Job
+	for _, job := range f.jobs {
+		cp := *job
+		jobs = append(jobs, &cp)
+	}
+	return jobs, nil
+}
+
+func (f *fakeStore) ListExpiredRollbackWindows(ctx context.Context) ([]*state.Job, error) {
+	return nil, nil
 }
 
 // fakePublisher records every envelope it receives — and can be told to
