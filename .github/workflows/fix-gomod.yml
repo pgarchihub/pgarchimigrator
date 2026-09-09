@@ -1,0 +1,44 @@
+name: Fix go.mod (temporary, self-removing)
+
+# Manually triggered only. Runs `go mod tidy` in an environment with
+# real Go 1.25 and unrestricted network access (unlike the sandbox this
+# was authored in, which could reach neither), commits the result if
+# go.mod/go.sum actually change, and deletes this workflow file itself
+# in the same commit — this is a one-shot fix, not a permanent part of
+# the pipeline.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: go mod tidy
+        run: go mod tidy
+
+      - name: Show diff
+        run: git diff --stat
+
+      - name: Remove this workflow file (one-shot)
+        run: rm -f .github/workflows/fix-gomod.yml
+
+      - name: Commit and push if anything changed
+        run: |
+          git config user.email "dev@pgarchihub.com"
+          git config user.name "pgArchiMigrator Release Bot"
+          git add -A go.mod go.sum .github/workflows/fix-gomod.yml
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "Fix go.mod/go.sum via go mod tidy (CI-generated, self-removing workflow)"
+            git push
+          fi
