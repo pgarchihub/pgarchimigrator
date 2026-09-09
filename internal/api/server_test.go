@@ -150,6 +150,15 @@ func (f *fakeStore) ListAll(ctx context.Context) ([]*state.Job, error) {
 	return jobs, nil
 }
 
+// count is a test-only helper (not part of state.Store) — several tests
+// assert exactly how many jobs got created without needing ListAll's
+// full job data, just the count.
+func (f *fakeStore) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.jobs)
+}
+
 // fakeFlow is a configurable orchestrator.Flow that never touches a real database.
 type fakeFlow struct {
 	executeErr  error
