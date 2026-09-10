@@ -75,7 +75,10 @@ build_portable_package() {
   mkdir -p "$pkg_dir/bin" "$pkg_dir/config/schema" "$pkg_dir/contracts" "$pkg_dir/migrations" "$pkg_dir/licenses"
 
   echo "==> Building frontend"
-  (cd "$REPO_ROOT/web" && npm run build >/dev/null)
+  # Not redirected to /dev/null (deliberately) — a silent frontend build
+  # failure here previously produced nothing more diagnosable than
+  # "exit code 1" in CI, with no visible npm error to work from.
+  (cd "$REPO_ROOT/web" && npm run build)
   rm -rf "$REPO_ROOT/internal/api/webapp"/*
   cp -r "$REPO_ROOT/web/dist"/* "$REPO_ROOT/internal/api/webapp/"
 

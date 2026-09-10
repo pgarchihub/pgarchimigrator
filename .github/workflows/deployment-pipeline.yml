@@ -55,7 +55,13 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
+          # Kept in sync with ci.yml's own frontend job and the
+          # Dockerfile's webbuild stage (both node:22) — this pipeline
+          # previously pinned 20, the one place that had drifted out of
+          # sync, which is exactly the kind of silent mismatch this
+          # comment exists to prevent recurring (see go.mod's own
+          # comment on the same lesson for the Go toolchain version).
 
       - name: go build ./... (every package, including cmd/pgarchisign)
         run: go build ./...
