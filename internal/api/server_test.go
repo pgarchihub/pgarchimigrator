@@ -1649,6 +1649,33 @@ func TestHandleStartUpgrade_TablesField_CarriesOverToTheJob(t *testing.T) {
 	if !ok || len(tables) != 2 {
 		t.Fatalf("expected 2 tables to carry over onto the job, got: %v", detail["Tables"])
 	}
+
+	// handleStartUpgrade deliberately fires flow.Run in a background
+	// goroutine and returns 202 immediately (see that handler's own doc
+	// comment — a real upgrade can run for hours, far too long to block
+	// an HTTP response on). This test's own assertion above doesn't
+	// depend on that goroutine finishing, but the test function
+	// returning WHILE IT'S STILL RUNNING does matter: t.Cleanup (LIFO)
+	// closes upgradeStore and then removes its t.TempDir() next,
+	// racing a goroutine that may still be writing to that same SQLite
+	// file if it hasn't reached a terminal phase yet — the real cause
+	// of this test's own "directory not empty" / "database is locked"
+	// style flakiness in CI. sourceDsn/targetDsn are deliberately
+	// unreachable here, so the real fix is waiting for the phase this
+	// goroutine settles into (FAILED, from the connection itself
+	// failing) rather than guessing at a sleep duration.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		pollRec := doRequest(t, srv, http.MethodGet, "/api/upgrades/"+startResp["id"], nil, users.admin)
+		var pollDetail map[string]any
+		_ = json.Unmarshal(pollRec.Body.Bytes(), &pollDetail)
+		switch pollDetail["Phase"] {
+		case string(upgrade.PhaseReady), string(upgrade.PhaseFailed), string(upgrade.PhaseAborted):
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("background flow.Run did not reach a terminal phase within 5s — test would otherwise race its own cleanup")
 }
 
 // --- Ecosystem upgrade endpoint (POST /api/v1/upgrades) tests ---
