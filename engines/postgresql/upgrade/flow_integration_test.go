@@ -57,8 +57,21 @@ func TestFlow_Run_EndToEnd_SmallTable(t *testing.T) {
 	}
 	t.Cleanup(func() { store.Close() })
 
+	// Tables (not Schemas) — deliberately scoped to exactly this one
+	// table rather than "every table in public". This matters for real
+	// test isolation: Schemas: []string{"public"} would pick up
+	// whatever any OTHER integration test package currently has
+	// sitting in the same shared "public" schema on this Docker
+	// Compose source instance (e.g. internal/api's own
+	// resource_status_integration_test.go, which uses a real pgxpool
+	// against the same instance) if `go test ./...` happens to run
+	// that package concurrently with this one — `go test` parallelizes
+	// across packages by default even with no t.Parallel() calls
+	// within either package. TablesVerified asserting exactly 1 below
+	// is only a meaningful check once this test can't observe another
+	// package's own tables at all, not just "usually doesn't".
 	job := &upgrade.Job{
-		Schemas:              []string{"public"},
+		Tables:               []upgrade.TableRef{{SchemaName: "public", TableName: "upgrade_e2e_orders"}},
 		SourceConnectionRef:  sourceTestDSN,
 		TargetConnectionRef:  targetTestDSN,
 		SourceReplicationRef: sourceReplicationTestDSN, // see this constant's own doc comment — required, not optional, in this Docker Compose test topology
