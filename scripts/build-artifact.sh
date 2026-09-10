@@ -75,6 +75,15 @@ build_portable_package() {
   mkdir -p "$pkg_dir/bin" "$pkg_dir/config/schema" "$pkg_dir/contracts" "$pkg_dir/migrations" "$pkg_dir/licenses"
 
   echo "==> Building frontend"
+  # npm ci (not npm install) — matches ci.yml's own frontend job
+  # exactly, installing precisely what package-lock.json pins rather
+  # than potentially resolving something new. This step was missing
+  # entirely before — the build script went straight to `npm run
+  # build` against whatever node_modules happened to already exist on
+  # the runner (none, on a fresh one), which is why this failed with
+  # "Cannot find module 'react'" and similar errors rather than an
+  # actual build problem.
+  (cd "$REPO_ROOT/web" && npm ci)
   # Not redirected to /dev/null (deliberately) — a silent frontend build
   # failure here previously produced nothing more diagnosable than
   # "exit code 1" in CI, with no visible npm error to work from.
