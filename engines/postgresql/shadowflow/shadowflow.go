@@ -190,7 +190,18 @@ func (f *ShadowFlow) Execute(ctx context.Context, job *state.Job) error {
 	job.ReplicationSlotName = names.slotName
 	job.ShadowTableName = names.shadowTable
 
-	pkCols, err := PrimaryKeyColumns(ctx, f.Pool, job.SchemaName, job.TableName)
+	// Reads the SHADOW table's own primary key, not the source table's —
+	// they're identical for every operation except PARTITION_TABLE
+	// (prepare's "CREATE TABLE (LIKE source INCLUDING ALL)" path copies
+	// the source's PK verbatim), but createPartitionedShadowTable's own
+	// PK can be a genuine superset of the source's (PostgreSQL requires
+	// the partition key to be part of any unique constraint on a
+	// partitioned table — see that function's own comment). Reading
+	// from the shadow table here means upsert's own ON CONFLICT target
+	// (apply.go) always matches whatever constraint actually exists on
+	// the table it's writing to, for every operation, without this
+	// function needing its own operation-specific branch.
+	pkCols, err := PrimaryKeyColumns(ctx, f.Pool, job.SchemaName, names.shadowTable)
 	if err != nil {
 		return f.failAndCleanup(ctx, job, names, deps, fmt.Errorf("failed to determine primary key columns: %w", err))
 	}
@@ -389,6 +400,15 @@ func (f *ShadowFlow) createPartitionedShadowTable(ctx context.Context, job *stat
 		return fmt.Errorf("source table %s.%s has no columns", job.SchemaName, job.TableName)
 	}
 
+	// The source table's own primary key — strategy.Decide already
+	// refuses PARTITION_TABLE for a table with no primary key at all
+	// (see TestDecide_PartitionTable_NoPrimaryKey_Fails), so this is
+	// never empty here.
+	sourcePK, err := PrimaryKeyColumns(ctx, f.Pool, job.SchemaName, job.TableName)
+	if err != nil {
+		return fmt.Errorf("failed to determine source table's primary key: %w", err)
+	}
+
 	colDefs := make([]string, 0, len(columns))
 	for _, c := range columns {
 		// c.Type/c.Default come straight from PostgreSQL's own catalog
@@ -407,6 +427,37 @@ func (f *ShadowFlow) createPartitionedShadowTable(ctx context.Context, job *stat
 		}
 		colDefs = append(colDefs, def)
 	}
+
+	// PostgreSQL's own rule for partitioned tables: every unique or
+	// exclusion constraint must include all partition key columns (see
+	// https://www.postgresql.org/docs/current/ddl-partitioning.html,
+	// "Unique constraints on partitioned tables must include all the
+	// partition key columns"). The plain "CREATE TABLE (LIKE source
+	// INCLUDING ALL)" path used elsewhere in this file copies the
+	// source's own primary key automatically; this manual path (forced
+	// by PostgreSQL disallowing LIKE combined with PARTITION BY — see
+	// this function's own header comment) has to build the constraint
+	// by hand instead, and previously built none at all — a real,
+	// reproducible bug: every INSERT/UPDATE the apply engine (upsert,
+	// see apply.go) later runs against this table uses ON CONFLICT
+	// against the primary key columns it expects to exist, which failed
+	// outright with no constraint here to match against.
+	pkCols := sourcePK
+	hasPartitionCol := false
+	for _, c := range pkCols {
+		if c == job.PartitionColumn {
+			hasPartitionCol = true
+			break
+		}
+	}
+	if !hasPartitionCol {
+		pkCols = append(append([]string{}, sourcePK...), job.PartitionColumn)
+	}
+	quotedPKCols := make([]string, len(pkCols))
+	for i, c := range pkCols {
+		quotedPKCols[i] = quoteIdent(c)
+	}
+	colDefs = append(colDefs, "PRIMARY KEY ("+strings.Join(quotedPKCols, ", ")+")")
 
 	createSQL := fmt.Sprintf("CREATE TABLE %s (%s) PARTITION BY %s (%s)",
 		shadowQualified, strings.Join(colDefs, ", "), job.PartitionStrategy, quoteIdent(job.PartitionColumn))
