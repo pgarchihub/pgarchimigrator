@@ -1,9 +1,14 @@
 module github.com/pgarchihub/pgarchimigrator
 
 // pgx v5.9.2 (see the require block below) transitively requires Go
-// >= 1.25.0. This directive is kept in sync with that — see the Dockerfile
-// build stage's comment for what breaks if it drifts out of sync again.
-go 1.26.0
+// >= 1.25.0. The patch-level pin below (not just "go 1.26") matters —
+// govulncheck's own security job scans the exact stdlib version this
+// directive resolves to; go1.26.0 itself carries known CVEs in
+// crypto/tls/encoding/asn1/encoding/xml/net/url that later patch
+// releases fixed. Keep this in sync with .github/workflows/ci.yml's
+// own go-version whenever either changes — see the Dockerfile build
+// stage's comment for what breaks if it drifts out of sync.
+go 1.26.6
 
 require (
 	github.com/jackc/pglogrepl v0.0.0-20260824121319-4ae5c490f7ce

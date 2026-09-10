@@ -21,14 +21,17 @@ RUN npm run build
 # pure Go — no cgo required — so CGO_ENABLED=0 produces a fully static
 # binary that can run on a minimal (even scratch) base image.
 #
-# Base image version note: pgx v5.9.1 (the version go.mod currently
-# resolves to — it was deliberately left unpinned, see go.mod's comment)
-# requires Go >= 1.25.0. Using an older golang:1.22 base here fails with
-# "requires go >= 1.25.0 (running go 1.22.x; GOTOOLCHAIN=local)" — the
+# Base image version note: pgx v5.9.2 (see go.mod's require block)
+# requires Go >= 1.25.0. Using an older golang base here (e.g. 1.22) fails
+# with "requires go >= 1.25.0 (running go 1.22.x; GOTOOLCHAIN=local)" — the
 # official Docker Go images set GOTOOLCHAIN=local, so they will NOT
 # auto-download a newer toolchain the way a developer's local `go` command
-# might. Keep this in sync with go.mod's `go` directive.
-FROM golang:1.25 AS build
+# might. The patch-level pin here (1.26.6, not just 1.26) matters beyond
+# just pgx's own minimum — see go.mod's own comment on why: govulncheck's
+# CI job scans the exact stdlib version this resolves to, and go1.26.0
+# itself carries known CVEs that 1.26.6 patches. Keep this in sync with
+# go.mod's `go` directive whenever either changes.
+FROM golang:1.26.6 AS build
 
 # VERSION is injected into the binary via -ldflags below (see
 # internal/version's doc comment for the full reasoning) — passed at

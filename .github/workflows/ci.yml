@@ -34,9 +34,14 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
-          # actions/setup-go caches the module + build cache keyed on
-          # go.sum by default — no extra config needed.
+          go-version-file: go.mod
+          # go-version-file (not a hardcoded go-version) reads the exact
+          # patch version from go.mod's own "go" directive — keeps this
+          # workflow from silently drifting out of sync with it again
+          # (see go.mod's own comment on why the patch level matters for
+          # govulncheck specifically). actions/setup-go caches the
+          # module + build cache keyed on go.sum by default — no extra
+          # config needed.
 
       - name: gofmt check
         # gofmt -l lists files that are NOT correctly formatted; the repo
@@ -93,7 +98,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version-file: go.mod
 
       - name: Start test PostgreSQL instances (PG ${{ matrix.postgres-version }})
         # Reuses the exact same compose file used for local development
