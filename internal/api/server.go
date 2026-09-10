@@ -225,8 +225,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/upgrades", s.protect(auth.RoleAdmin, s.handleStartUpgrade))
 	s.mux.HandleFunc("POST /api/upgrades/introspect-source", s.protect(auth.RoleAdmin, s.handleIntrospectUpgradeSource))
 	s.mux.HandleFunc("POST /api/upgrades/{id}/retry", s.protect(auth.RoleAdmin, s.handleRetryUpgrade))
-	s.mux.HandleFunc("GET /api/upgrades", s.protect(auth.RoleOperator, s.handleListUpgrades))
-	s.mux.HandleFunc("GET /api/upgrades/{id}", s.protect(auth.RoleOperator, s.handleGetUpgrade))
+	s.mux.HandleFunc("GET /api/upgrades", s.protect(auth.RoleViewer, s.handleListUpgrades))
+	s.mux.HandleFunc("GET /api/upgrades/{id}", s.protect(auth.RoleViewer, s.handleGetUpgrade))
 	s.mux.HandleFunc("POST /api/migrations/preview", s.protect(auth.RoleViewer, s.handlePreviewMigration))
 	// Read-only catalog browsing for the New Migration screen's
 	// schema/table/column dropdowns — see engines/postgresql/catalog's package doc

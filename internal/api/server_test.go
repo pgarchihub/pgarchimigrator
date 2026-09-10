@@ -1813,8 +1813,15 @@ func TestHandleRetryMigration_CreatesNewJobWithSameParameters(t *testing.T) {
 	if retried["Operation"] != "ADD_COLUMN" {
 		t.Errorf("expected Operation='ADD_COLUMN' to carry over, got %v", retried["Operation"])
 	}
-	if retried["ColumnName"] != "total" {
-		t.Errorf("expected ColumnName='total' to carry over, got %v", retried["ColumnName"])
+	// progress.Report (what this endpoint actually returns) has no raw
+	// ColumnName field by design — describeOperation folds it into a
+	// human-readable OperationSummary instead (see that function's own
+	// ADD_COLUMN case: fmt.Sprintf("Added column %q ...", job.ColumnName,
+	// ...)), so asserting the parameter carried over means checking it
+	// shows up there, not on a field this response was never meant to have.
+	summary, _ := retried["OperationSummary"].(string)
+	if !strings.Contains(summary, `"total"`) {
+		t.Errorf("expected the retried job's OperationSummary to mention column %q, got %q", "total", summary)
 	}
 }
 
