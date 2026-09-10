@@ -21,7 +21,7 @@ export default function NewUpgrade() {
   // set, selectedTables drives what's sent) OR a plain typed schema
   // list (schemasRaw) — see handleSubmit's own comment for exactly how
   // the two are mutually exclusive, matching
-  // engines/postgresql/upgrade.Job.Tables' own doc comment on the same design
+  // internal/engines/postgresql/upgrade.Job.Tables' own doc comment on the same design
   // decision.
   const [introspectedSchemas, setIntrospectedSchemas] = useState<IntrospectedSchema[] | null>(null);
   const [selectedTables, setSelectedTables] = useState<Set<string>>(new Set());
@@ -101,7 +101,7 @@ export default function NewUpgrade() {
         : undefined;
 
       // Mutually exclusive with schemas, matching
-      // engines/postgresql/upgrade.Job.Tables' own doc comment: once schemas have
+      // internal/engines/postgresql/upgrade.Job.Tables' own doc comment: once schemas have
       // been fetched, the checkbox selection is ALWAYS what's sent —
       // even if every box happens to be checked, this still goes as an
       // explicit table list rather than falling back to schemas, so

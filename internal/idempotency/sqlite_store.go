@@ -106,7 +106,7 @@ func (s *SQLiteStore) Put(ctx context.Context, record *Record) error {
 
 // DeleteExpired removes every record older than DefaultRetention and
 // returns how many were deleted — intended to be called from a
-// periodic background loop (matching engines/postgresql/reaper's own role for
+// periodic background loop (matching internal/engines/postgresql/reaper's own role for
 // migration jobs), so this table doesn't grow forever on a
 // long-running instance.
 func (s *SQLiteStore) DeleteExpired(ctx context.Context) (int64, error) {

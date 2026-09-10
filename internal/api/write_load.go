@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/db"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/db"
 )
 
 // writeLoadSampleDuration is how long handleEstimateWriteLoad blocks the
@@ -61,7 +61,7 @@ func (s *Server) handleEstimateWriteLoad(w http.ResponseWriter, r *http.Request)
 // isWriteLoadCautionWorthy is the pure threshold logic
 // handleEstimateWriteLoad applies to the sampled rate — split out so
 // it's testable without a real PostgreSQL connection (matching
-// engines/postgresql/db's isCheckpointPressured, the same pattern used for the
+// internal/engines/postgresql/db's isCheckpointPressured, the same pattern used for the
 // checkpoint-pressure indicator's own threshold).
 func isWriteLoadCautionWorthy(bytesPerSecond float64) bool {
 	return bytesPerSecond >= writeLoadCautionThresholdBytesPerSecond

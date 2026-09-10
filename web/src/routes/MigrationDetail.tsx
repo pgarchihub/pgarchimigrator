@@ -48,8 +48,8 @@ interface HealthCheck {
 // other than SHADOW_TABLE (e.g. showing "row counts/checksums matched"
 // for an ADD_INDEX migration, which never compared row counts at all —
 // it confirmed the created index passed PostgreSQL's own validity
-// check instead). See engines/postgresql/progress's pipelineFor and
-// engines/postgresql/ddlflow's executeAddIndex/executeSetNotNull/
+// check instead). See internal/engines/postgresql/progress's pipelineFor and
+// internal/engines/postgresql/ddlflow's executeAddIndex/executeSetNotNull/
 // executeExpandBackfill for what each operation's VALIDATING stage
 // actually does.
 function validatedSuccessDetail(job: MigrationReport): string {
@@ -130,7 +130,7 @@ function lagTrendDisplay(trend: string): { label: string; tone: "coral" | "succe
 // stepStatus computes the step list's label/color for a single stage —
 // exported (and unit-tested) on its own because of a real, user-reported
 // bug: a FAILED/ABORTED job's terminal stage is deliberately marked
-// "CURRENT" by the backend (see engines/postgresql/progress.Compute's early-return
+// "CURRENT" by the backend (see internal/engines/postgresql/progress.Compute's early-return
 // path), purely so PhaseTrack's graphic can highlight where things
 // stopped. Reading that literally as "In progress" — which is what a
 // naive stage.Status === "CURRENT" check does — is actively wrong
@@ -306,7 +306,7 @@ export default function MigrationDetail() {
   // a post-completion rollback (some do — ADD_INDEX, SET_NOT_NULL,
   // ADD_CONSTRAINT, RENAME_COLUMN, DROP_INDEX all remain safely reversible
   // even after COMPLETED; others, like a plain ADD_COLUMN, refuse once
-  // COMPLETED — see engines/postgresql/ddlflow's Rollback for the real rules per
+  // COMPLETED — see internal/engines/postgresql/ddlflow's Rollback for the real rules per
   // operation). The button is offered whenever the job isn't already
   // ABORTED; the backend is the actual source of truth and returns a
   // clear LastError via the 422 case (see api.rollbackMigration) if this
@@ -388,7 +388,7 @@ export default function MigrationDetail() {
           feel bare: previously nothing here said what the job actually
           DOES beyond the strategy/phase badges. OperationSummary and
           Statements are computed server-side, straight from the job's own
-          persisted parameters (see engines/postgresql/progress.describeOperation),
+          persisted parameters (see internal/engines/postgresql/progress.describeOperation),
           so this is accurate even for a job that finished hours ago. */}
       <Card>
         <CardHeader>
@@ -406,7 +406,7 @@ export default function MigrationDetail() {
 
           {/* Optional chaining is deliberate defense-in-depth, not just
               style: the backend is now fixed to never send a null
-              Statements field (see engines/postgresql/progress.describeOperation),
+              Statements field (see internal/engines/postgresql/progress.describeOperation),
               but this is exactly the field a real, user-reported crash
               came from — a Go nil slice serializing to JSON `null` and
               this unconditional `.length` access blowing up the whole

@@ -12,7 +12,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/progress"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/progress"
 	"github.com/pgarchihub/pgarchimigrator/internal/state"
 )
 

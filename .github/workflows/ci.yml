@@ -114,7 +114,7 @@ jobs:
 
       - name: Wait for pg-logical and pg-upgrade-target to accept connections
         # pg-upgrade-target (deploy/docker-compose.dev.yml) is
-        # engines/postgresql/upgrade's own second, separate PostgreSQL instance —
+        # internal/engines/postgresql/upgrade's own second, separate PostgreSQL instance —
         # its own integration tests need it just as much as pg-logical,
         # so it needs the same readiness gate pg-logical already had,
         # not just an implicit "docker compose up finished starting
@@ -146,9 +146,9 @@ jobs:
         # here shares ONE real PostgreSQL instance (the docker-compose
         # services brought up above), and several packages deliberately
         # create real locks/transactions as part of their own testing
-        # (see e.g. engines/postgresql/ddlflow's lock_timeout tests,
-        # engines/postgresql/shadowflow's swap tests). Without -p 1, Go runs those
-        # packages CONCURRENTLY with engines/postgresql/monitor's
+        # (see e.g. internal/engines/postgresql/ddlflow's lock_timeout tests,
+        # internal/engines/postgresql/shadowflow's swap tests). Without -p 1, Go runs those
+        # packages CONCURRENTLY with internal/engines/postgresql/monitor's
         # TestCheckLockWait_NoLocks_ReturnsFalse — which asserts there
         # are NO pending locks anywhere in the database — a real,
         # confirmed flaky-CI-failure this exact combination caused: a

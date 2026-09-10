@@ -1,7 +1,7 @@
 // Package api implements the REST API and dashboard described in
 // Architecture Doc Section 5 ("CLI (Cobra) + REST API", "Basit Web UI
 // (Dashboard)"). It is a thin HTTP wrapper around internal/orchestrator,
-// internal/state, and engines/postgresql/reaper — no business logic lives here.
+// internal/state, and internal/engines/postgresql/reaper — no business logic lives here.
 //
 // Built on Go 1.22's stdlib http.ServeMux method+path routing
 // (e.g. "POST /api/migrations") rather than a third-party router: this
@@ -25,16 +25,16 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/catalog"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/db"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/preview"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/progress"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/reaper"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/typecompat"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/upgrade"
 	"github.com/pgarchihub/pgarchimigrator/internal/api/ecosystemmanifest"
 	"github.com/pgarchihub/pgarchimigrator/internal/auth"
 	"github.com/pgarchihub/pgarchimigrator/internal/ecosystem"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/catalog"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/db"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/preview"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/progress"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/reaper"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/typecompat"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/upgrade"
 	"github.com/pgarchihub/pgarchimigrator/internal/idempotency"
 	"github.com/pgarchihub/pgarchimigrator/internal/orchestrator"
 	"github.com/pgarchihub/pgarchimigrator/internal/serviceauth"
@@ -92,9 +92,9 @@ type Server struct {
 	// UpgradeStore/UpgradeConnections are optional — nil disables the
 	// /api/upgrades routes entirely (503), same "absent, not broken"
 	// precedent. See docs/ecosystem/ARCHITECTURE.md's "PostgreSQL
-	// major-version upgrade" section — engines/postgresql/upgrade is CLI-only as
+	// major-version upgrade" section — internal/engines/postgresql/upgrade is CLI-only as
 	// of that document's last update; these two fields are what let the
-	// same engines/postgresql/upgrade.Flow/Store also be driven from the
+	// same internal/engines/postgresql/upgrade.Flow/Store also be driven from the
 	// dashboard/API rather than only `pgarchimigrator upgrade start`.
 	UpgradeStore       upgrade.Store
 	UpgradeConnections upgrade.ConnectionProvider
@@ -106,9 +106,9 @@ type Server struct {
 	// in order to work at all).
 	IdempotencyStore idempotency.Store
 	// Pool is used directly (not just through Orchestrator/Store) by
-	// handlePreviewMigration, since engines/postgresql/preview needs read-only
+	// handlePreviewMigration, since internal/engines/postgresql/preview needs read-only
 	// access to run its dry-run sanity-check queries (e.g. counting
-	// existing NULLs before a SET_NOT_NULL) — see engines/postgresql/preview's
+	// existing NULLs before a SET_NOT_NULL) — see internal/engines/postgresql/preview's
 	// package doc comment for why dry-run still touches the database.
 	Pool *pgxpool.Pool
 	// secureCookies controls the session cookie's Secure flag — true
@@ -229,7 +229,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/upgrades/{id}", s.protect(auth.RoleViewer, s.handleGetUpgrade))
 	s.mux.HandleFunc("POST /api/migrations/preview", s.protect(auth.RoleViewer, s.handlePreviewMigration))
 	// Read-only catalog browsing for the New Migration screen's
-	// schema/table/column dropdowns — see engines/postgresql/catalog's package doc
+	// schema/table/column dropdowns — see internal/engines/postgresql/catalog's package doc
 	// comment. RoleViewer is enough: nothing here mutates anything or
 	// reads actual row data, only pg_catalog/information_schema metadata.
 	s.mux.HandleFunc("GET /api/schemas", s.protect(auth.RoleViewer, s.handleListSchemas))
@@ -506,7 +506,7 @@ func (s *Server) handleEcosystemStartMigration(w http.ResponseWriter, r *http.Re
 //
 // One real, documented limitation: upgrade.Job carries no
 // CorrelationID/CausationID/LifecycleID fields the way state.Job does
-// (see that type's own doc comment) — engines/postgresql/upgrade was designed
+// (see that type's own doc comment) — internal/engines/postgresql/upgrade was designed
 // before this endpoint existed, and adding those fields now would mean
 // a fourth SQLite schema change to upgrade_jobs purely to carry context
 // this endpoint can't yet do anything with beyond the first published
@@ -1062,11 +1062,11 @@ func buildMigrationRequest(req startMigrationRequest) (orchestrator.MigrationReq
 
 // handlePreviewMigration is the dry-run counterpart of
 // handleStartMigration: same request shape and validation, but never
-// creates a job or runs any DDL — see engines/postgresql/preview's package doc
+// creates a job or runs any DDL — see internal/engines/postgresql/preview's package doc
 // comment. RoleViewer is enough to call this (unlike RoleOperator for the
 // real thing) since it makes no changes at all.
 // resolveTypeCompatibility fills in migReq.Change.TypeConversionCompatible
-// for ALTER_COLUMN_TYPE requests using engines/postgresql/typecompat's curated,
+// for ALTER_COLUMN_TYPE requests using internal/engines/postgresql/typecompat's curated,
 // conservative detection — see that package's doc comment for the exact
 // scope and the safety reasoning. Skipped entirely when the caller gave
 // an explicit StrategyOverride: an explicit choice always wins, this
@@ -1111,7 +1111,7 @@ func (s *Server) handlePreviewMigration(w http.ResponseWriter, r *http.Request) 
 
 // handleListSchemas/handleListTables/handleListColumns back the New
 // Migration screen's schema/table/column dropdowns — see
-// engines/postgresql/catalog's package doc comment for the read-only guarantee.
+// internal/engines/postgresql/catalog's package doc comment for the read-only guarantee.
 func (s *Server) handleListSchemas(w http.ResponseWriter, r *http.Request) {
 	schemas, err := catalog.ListSchemas(r.Context(), s.Pool)
 	if err != nil {

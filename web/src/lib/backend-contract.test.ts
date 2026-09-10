@@ -5,7 +5,7 @@ import type { StageView } from "./types";
 // Status type (and every comparison against it, in PhaseTrack.tsx and
 // MigrationDetail.tsx) used lowercase "done"/"current"/"pending" for a
 // long stretch of this project, while the real backend
-// (engines/postgresql/progress's StageStatus constants) has ALWAYS sent uppercase
+// (internal/engines/postgresql/progress's StageStatus constants) has ALWAYS sent uppercase
 // "DONE"/"CURRENT"/"PENDING". Every comparison silently never matched,
 // so a completed migration's phase track and step list both rendered as
 // if every stage were still pending.
@@ -24,8 +24,8 @@ import type { StageView } from "./types";
 // "fixes" this test by making it agree with a re-introduced bug instead
 // of fixing the bug, that's a visible, deliberate act, not an accident.
 describe("StageView.Status backend contract", () => {
-  it("matches engines/postgresql/progress's StageStatus constants exactly (DONE / CURRENT / PENDING, uppercase)", () => {
-    // See engines/postgresql/progress/progress.go:
+  it("matches internal/engines/postgresql/progress's StageStatus constants exactly (DONE / CURRENT / PENDING, uppercase)", () => {
+    // See internal/engines/postgresql/progress/progress.go:
     //   StageDone    StageStatus = "DONE"
     //   StageCurrent StageStatus = "CURRENT"
     //   StagePending StageStatus = "PENDING"

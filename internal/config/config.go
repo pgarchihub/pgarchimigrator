@@ -5,8 +5,8 @@ package config
 import (
 	"time"
 
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/monitor"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/shadowflow"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/monitor"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/shadowflow"
 )
 
 // Config gathers the entire application configuration in one place.
@@ -29,7 +29,7 @@ type Config struct {
 
 	AuthDBPath string `yaml:"auth_db_path"` // SQLite file path for internal/auth's users/sessions — deliberately a SEPARATE file from StateDBPath, see internal/auth's package doc comment
 
-	UpgradeDBPath string `yaml:"upgrade_db_path"` // SQLite file path for engines/postgresql/upgrade's job/table progress — deliberately its own file, see engines/postgresql/upgrade.SQLiteStore's own doc comment on why write isolation from StateDBPath matters here specifically
+	UpgradeDBPath string `yaml:"upgrade_db_path"` // SQLite file path for internal/engines/postgresql/upgrade's job/table progress — deliberately its own file, see internal/engines/postgresql/upgrade.SQLiteStore's own doc comment on why write isolation from StateDBPath matters here specifically
 }
 
 // Default returns a Config populated with the defaults from the

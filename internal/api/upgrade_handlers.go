@@ -10,8 +10,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/catalog"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/upgrade"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/catalog"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/upgrade"
 )
 
 // startUpgradeRequest is the human/dashboard-facing counterpart to
@@ -38,7 +38,7 @@ type startUpgradeRequest struct {
 }
 
 // handleStartUpgrade creates an upgrade.Job and runs its Flow in the
-// background — the engines/postgresql/upgrade analog of
+// background — the internal/engines/postgresql/upgrade analog of
 // orchestrator.StartMigrationAsync, for the identical reason: a
 // whole-database upgrade can genuinely take hours, far longer than any
 // HTTP client should be expected to block on. Returns 503 if
@@ -144,7 +144,7 @@ func (s *Server) handleGetUpgrade(w http.ResponseWriter, r *http.Request) {
 // existing job — retry's own upgrade counterpart to
 // handleRetryMigration, see that function's own doc comment for the
 // "genuinely new job, not a resumption" reasoning, which applies
-// identically here (engines/postgresql/upgrade.Flow has no "reset a FAILED job"
+// identically here (internal/engines/postgresql/upgrade.Flow has no "reset a FAILED job"
 // operation either).
 //
 // This is precisely why upgrade.Job stores SourceConnectionRef/
@@ -299,7 +299,7 @@ const introspectTimeout = 10 * time.Second
 // Grants no capability an admin didn't already have — starting a real
 // upgrade already lets this same caller connect to and act on any
 // PostgreSQL instance whose connection string they can supply; this
-// endpoint only reads catalog metadata (engines/postgresql/catalog.ListSchemas/
+// endpoint only reads catalog metadata (internal/engines/postgresql/catalog.ListSchemas/
 // ListTables, the exact same introspection every other operation in
 // this codebase already uses), so it doesn't expand what an admin
 // could already do. RoleAdmin-gated to match the same role

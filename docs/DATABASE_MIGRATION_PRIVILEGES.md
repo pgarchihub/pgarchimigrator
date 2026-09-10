@@ -3,7 +3,7 @@
 > This document honestly documents **what privileges** the native
 > PostgreSQL logical replication (`CREATE PUBLICATION`/
 > `CREATE SUBSCRIPTION`) that both the `SHADOW_TABLE` strategy
-> (Zero-Downtime Migration) and `engines/postgresql/upgrade` (Database Migration)
+> (Zero-Downtime Migration) and `internal/engines/postgresql/upgrade` (Database Migration)
 > depend on **actually require**, and what that means on **common
 > managed PostgreSQL providers**. The goal: give a user a clear answer
 > up front to "why doesn't this work?" instead of trial and error.
@@ -12,14 +12,14 @@
 
 Both mechanisms rely on **the same underlying PostgreSQL commands**:
 
-- **`SHADOW_TABLE`** (`engines/postgresql/shadowflow`) — for incompatible type
+- **`SHADOW_TABLE`** (`internal/engines/postgresql/shadowflow`) — for incompatible type
   changes on large tables and for `PARTITION_TABLE`, creates a shadow
   table **within the same instance** and keeps it in sync via logical
   replication.
-- **`engines/postgresql/upgrade`** (Database Migration) — moves a whole database
+- **`internal/engines/postgresql/upgrade`** (Database Migration) — moves a whole database
   via logical replication **between two separate instances**.
 
-`engines/postgresql/upgrade`'s `CreatePublication` function **always** uses
+`internal/engines/postgresql/upgrade`'s `CreatePublication` function **always** uses
 `CREATE PUBLICATION ... FOR TABLE <explicit list>` — **never**
 `FOR ALL TABLES` (see `sync.go`'s own doc comment). This is a
 **deliberate design decision** and directly affects the privilege
@@ -53,7 +53,7 @@ The `pg_create_subscription` role was **added in PostgreSQL 16** (see
 the sources). This has a real practical consequence:
 
 > **If the target instance is on PostgreSQL 15 or earlier, this tool
-> (both `SHADOW_TABLE` and `engines/postgresql/upgrade`) needs a superuser
+> (both `SHADOW_TABLE` and `internal/engines/postgresql/upgrade`) needs a superuser
 > account on the target (or a role that's nearly equivalent to
 > superuser — see Section 3).** There is no way to run
 > `CREATE SUBSCRIPTION` with a low-privilege application user on PG 15

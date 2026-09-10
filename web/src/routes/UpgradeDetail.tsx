@@ -25,7 +25,7 @@ function isTerminal(phase: UpgradePhase): boolean {
 
 // PHASE_ORDER gives every non-terminal phase a fixed position for the
 // simple step indicator below — mirrors the ordering
-// engines/postgresql/upgrade.Flow.Run itself drives the job through (see that
+// internal/engines/postgresql/upgrade.Flow.Run itself drives the job through (see that
 // function's own doc comment), not something this file invents
 // independently.
 const PHASE_ORDER: UpgradePhase[] = ["INTROSPECTING", "SCHEMA_CREATED", "SYNCING", "VALIDATING", "READY"];

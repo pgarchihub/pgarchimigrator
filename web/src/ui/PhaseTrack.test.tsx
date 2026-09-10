@@ -150,7 +150,7 @@ describe("PhaseTrack", () => {
 
     it("full mode's minWidth scales up with more stages (so a 9-station SHADOW_TABLE track stays readable)", () => {
       const twoStages = [stage("PREPARATION", "DONE"), stage("COMPLETED", "PENDING")];
-      // The real 9-phase SHADOW_TABLE pipeline (see engines/postgresql/progress's
+      // The real 9-phase SHADOW_TABLE pipeline (see internal/engines/postgresql/progress's
       // pipelineFor) — reused here rather than synthetic phase names, so
       // this stays a faithful stand-in for the actual worst case.
       const nineStages = [

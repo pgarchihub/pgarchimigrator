@@ -1,6 +1,6 @@
 // Package orchestrator implements the "Orchestration Engine" described in
-// Architecture Doc Section 3.1. It runs engines/postgresql/ddlflow or
-// engines/postgresql/shadowflow based on the decision from internal/strategy, and
+// Architecture Doc Section 3.1. It runs internal/engines/postgresql/ddlflow or
+// internal/engines/postgresql/shadowflow based on the decision from internal/strategy, and
 // checkpoints progress via internal/state.
 package orchestrator
 
@@ -18,8 +18,8 @@ import (
 )
 
 // Flow is the common interface for a concrete migration strategy executor
-// (Direct DDL, Expand&Backfill, Shadow Table). engines/postgresql/ddlflow and
-// engines/postgresql/shadowflow implement this interface — the orchestrator can call
+// (Direct DDL, Expand&Backfill, Shadow Table). internal/engines/postgresql/ddlflow and
+// internal/engines/postgresql/shadowflow implement this interface — the orchestrator can call
 // either the same way without knowing which strategy it is (Step Executor,
 // Section 3.1).
 type Flow interface {
@@ -34,15 +34,15 @@ type Flow interface {
 }
 
 // TableStatsFetcher supplies the raw table statistics strategy.Decide
-// needs. Kept as an injectable function (rather than importing engines/postgresql/db
+// needs. Kept as an injectable function (rather than importing internal/engines/postgresql/db
 // directly) so this package stays decoupled from any specific database
 // driver — the same pattern already used by FlowFor below. In production,
 // this is backed by db.FetchTableStats; tests can supply a fake.
 type TableStatsFetcher func(ctx context.Context, schema, table string) (strategy.TableStats, error)
 
 // FlowBuilder builds the concrete Flow for a given strategy decision. In
-// production this constructs an engines/postgresql/ddlflow.DDLFlow or
-// engines/postgresql/shadowflow.ShadowFlow (both already implement Flow); tests can
+// production this constructs an internal/engines/postgresql/ddlflow.DDLFlow or
+// internal/engines/postgresql/shadowflow.ShadowFlow (both already implement Flow); tests can
 // supply a fake that never touches a real database.
 type FlowBuilder func(strat strategy.Strategy) (Flow, error)
 
@@ -60,7 +60,7 @@ type Orchestrator struct {
 	// strategy-independent TR-11 minimum-version gate, checked once at
 	// the very start of every StartMigration call regardless of which
 	// strategy ends up being chosen. Added specifically because the
-	// shadow-table-specific preflight check (engines/postgresql/db's
+	// shadow-table-specific preflight check (internal/engines/postgresql/db's
 	// PgxPreflighter) previously left DIRECT_DDL/EXPAND_BACKFILL
 	// migrations completely unchecked against this same minimum. In
 	// production this is backed by db.ValidateMinimumVersion; tests that
@@ -110,8 +110,8 @@ type MigrationRequest struct {
 // error, so the caller can inspect job.Phase/job.LastError — Flow.Execute
 // implementations are responsible for marking the job FAILED and cleaning
 // up their own partial resources before returning an error (see
-// engines/postgresql/ddlflow.DDLFlow.fail and
-// engines/postgresql/shadowflow.ShadowFlow.failAndCleanup); StartMigration itself
+// internal/engines/postgresql/ddlflow.DDLFlow.fail and
+// internal/engines/postgresql/shadowflow.ShadowFlow.failAndCleanup); StartMigration itself
 // does not attempt any additional cleanup.
 // preparedJob is prepareJob's return value — everything StartMigration
 // and StartMigrationAsync share, up to (and including) the point the
@@ -169,8 +169,8 @@ func (o *Orchestrator) prepareJob(ctx context.Context, req MigrationRequest) (*p
 	// directly into DDL text later (PostgreSQL doesn't support parameter
 	// binding inside ALTER TABLE/ADD COLUMN/ADD CONSTRAINT), so an
 	// unvalidated caller-supplied value was a genuine SQL injection
-	// vector. Enforced again at the point engines/postgresql/ddlflow and
-	// engines/postgresql/shadowflow actually build DDL from these values, so any
+	// vector. Enforced again at the point internal/engines/postgresql/ddlflow and
+	// internal/engines/postgresql/shadowflow actually build DDL from these values, so any
 	// direct caller of those flows (not just ones that went through
 	// StartMigration) gets the same protection — this early check is an
 	// additional, better-UX layer (a clear 4xx before any job exists),
@@ -327,7 +327,7 @@ func (o *Orchestrator) StartMigration(ctx context.Context, req MigrationRequest)
 // the moment the handler returns (immediately after this function
 // hands back the job) — using it for the background Execute call would
 // abort the migration within moments of starting it. This mirrors how
-// engines/postgresql/reaper's own background sweep loop is deliberately given its
+// internal/engines/postgresql/reaper's own background sweep loop is deliberately given its
 // own long-lived context rather than reusing whatever request triggered
 // it.
 func (o *Orchestrator) StartMigrationAsync(ctx context.Context, req MigrationRequest) (*state.Job, error) {

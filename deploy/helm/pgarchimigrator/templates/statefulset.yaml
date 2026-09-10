@@ -90,7 +90,7 @@ spec:
       {{- end }}
       {{- if not .Values.persistence.enabled }}
       # WARNING: with persistence disabled, /data (and the state store
-      # within it) is lost on every pod restart — engines/postgresql/reaper will
+      # within it) is lost on every pod restart — internal/engines/postgresql/reaper will
       # never learn about in-flight migrations from before the restart,
       # leaving their PostgreSQL-side resources (replication slots, shadow
       # tables) permanently orphaned. Only disable persistence for

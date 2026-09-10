@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/upgrade"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/upgrade"
 	"github.com/pgarchihub/pgarchimigrator/internal/entitlement"
 )
 

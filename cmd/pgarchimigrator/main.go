@@ -20,19 +20,19 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/spf13/cobra"
 
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/db"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/ddlflow"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/preview"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/progress"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/reaper"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/shadowflow"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/typecompat"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/upgrade"
 	"github.com/pgarchihub/pgarchimigrator/internal/api"
 	"github.com/pgarchihub/pgarchimigrator/internal/auditlog"
 	"github.com/pgarchihub/pgarchimigrator/internal/auth"
 	"github.com/pgarchihub/pgarchimigrator/internal/config"
 	"github.com/pgarchihub/pgarchimigrator/internal/ecosystem"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/db"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/ddlflow"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/preview"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/progress"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/reaper"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/shadowflow"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/typecompat"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/upgrade"
 	"github.com/pgarchihub/pgarchimigrator/internal/entitlement"
 	"github.com/pgarchihub/pgarchimigrator/internal/idempotency"
 	"github.com/pgarchihub/pgarchimigrator/internal/migrationfile"
@@ -420,7 +420,7 @@ func newMigrateCmd() *cobra.Command {
 
 			// Automatic type-compatibility detection: for ALTER_COLUMN_TYPE
 			// requests, check whether this specific old-type -> new-type
-			// change is one of engines/postgresql/typecompat's curated "free" cases
+			// change is one of internal/engines/postgresql/typecompat's curated "free" cases
 			// (PostgreSQL applies it as metadata-only, no table rewrite).
 			// Deliberately skipped entirely when the user gave an explicit
 			// --strategy override — an explicit choice always wins, this
@@ -803,7 +803,7 @@ func newListCmd() *cobra.Command {
 // newSweepCmd runs a single reaper pass on demand: orphan/crash cleanup
 // (ScanOnce) plus completing migrations whose FR-08a rollback window has
 // expired (SweepExpiredRollbackWindows). In production this normally runs
-// automatically via reaper.Run's periodic loop (see engines/postgresql/reaper); this
+// automatically via reaper.Run's periodic loop (see internal/engines/postgresql/reaper); this
 // command exists for manual/on-demand cleanup and for cron-based
 // deployments that prefer an external scheduler over a long-running
 // process.
@@ -897,7 +897,7 @@ func newServeCmd() *cobra.Command {
 			// docs/ecosystem/ARCHITECTURE.md's own "PostgreSQL
 			// major-version upgrade" section) — its own separate
 			// SQLite file, same "isolate this write path" reasoning
-			// as engines/postgresql/upgrade.SQLiteStore's own doc comment.
+			// as internal/engines/postgresql/upgrade.SQLiteStore's own doc comment.
 			// StaticConnectionProvider is today's only
 			// ConnectionProvider — see that type's own doc comment for
 			// why Enterprise/Cloud can later swap in a dynamic one
@@ -992,7 +992,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&authDBPath, "auth-db", config.Default().AuthDBPath, "path to the SQLite auth database (users, sessions)")
 	cmd.Flags().StringVar(&upgradeDBPath, "upgrade-db", config.Default().UpgradeDBPath, "path to the SQLite upgrade-progress database")
 	cmd.Flags().StringVar(&addr, "addr", ":8080", "address to listen on")
-	cmd.Flags().BoolVar(&autoSweep, "auto-sweep", true, "run engines/postgresql/reaper's periodic sweep loop in the background while serving")
+	cmd.Flags().BoolVar(&autoSweep, "auto-sweep", true, "run internal/engines/postgresql/reaper's periodic sweep loop in the background while serving")
 	cmd.Flags().BoolVar(&secureCookies, "secure-cookies", false, "mark the session cookie Secure (set true once served behind HTTPS)")
 	return cmd
 }
@@ -1191,12 +1191,12 @@ func randomHex(n int) string {
 	return hex.EncodeToString(buf)
 }
 
-// newUpgradeCmd groups commands for engines/postgresql/upgrade — PostgreSQL
+// newUpgradeCmd groups commands for internal/engines/postgresql/upgrade — PostgreSQL
 // major-version upgrades (see docs/ecosystem/ARCHITECTURE.md's own
 // "PostgreSQL major-version upgrade" section for the full design).
 // Deliberately its own top-level command, not folded under an existing
 // one — an upgrade job is conceptually unrelated to a single-table
-// migration job (see engines/postgresql/upgrade's own package doc comment for why
+// migration job (see internal/engines/postgresql/upgrade's own package doc comment for why
 // it's a parallel package rather than a new operation type), so it gets
 // its own parallel command tree rather than living under `migrate` or
 // sharing flags/state with it.

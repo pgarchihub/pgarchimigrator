@@ -141,7 +141,7 @@ func VerifyInventory(installPath string, manifest InventoryManifest) error {
 // established "validate again at the point of actual use, don't rely
 // solely on an earlier check" pattern (see e.g.
 // internal/orchestrator.prepareJob's own DDL-injection validation,
-// re-enforced again in engines/postgresql/ddlflow/engines/postgresql/shadowflow).
+// re-enforced again in internal/engines/postgresql/ddlflow/internal/engines/postgresql/shadowflow).
 func ResolveEntrypoint(installPath string, manifest InventoryManifest) (string, error) {
 	if manifest.AllowedEntrypoint == "" {
 		return "", fmt.Errorf("manifest does not declare an AllowedEntrypoint")

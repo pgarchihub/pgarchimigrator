@@ -58,7 +58,7 @@ func main() {
 // pgxIdent quotes a PostgreSQL identifier — the table name here comes
 // from a command-line flag, not a hardcoded literal, so it's escaped the
 // same way the rest of this project always escapes identifiers built
-// from external input (see engines/postgresql/ddlflow's quoteIdent and its several
+// from external input (see internal/engines/postgresql/ddlflow's quoteIdent and its several
 // sibling copies — this is deliberately a 6th, since this tool is a
 // separate binary with no internal/ import, matching its own
 // external-REST-client design).
@@ -364,7 +364,7 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&checkExpression, "check-expression", "", "CHECK expression (ADD_CONSTRAINT)")
 	cmd.Flags().StringVar(&strategyOverride, "strategy-override", "", "force a specific strategy: DIRECT_DDL, EXPAND_BACKFILL, or SHADOW_TABLE — "+
 		"needed to reliably load-test SHADOW_TABLE via ALTER_COLUMN_TYPE, since the server otherwise picks automatically based on "+
-		"whether the old/new types are compatible (see engines/postgresql/typecompat), which isn't always obvious from the column types alone")
+		"whether the old/new types are compatible (see internal/engines/postgresql/typecompat), which isn't always obvious from the column types alone")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 20, "number of concurrent traffic goroutines")
 	cmd.Flags().DurationVar(&warmup, "warmup", 30*time.Second, "baseline traffic duration before starting the migration")
 	cmd.Flags().DurationVar(&cooldown, "cooldown", 30*time.Second, "baseline traffic duration after the migration completes")
@@ -418,7 +418,7 @@ const blockingLocksQuery = `
 // the traffic samples alone can't distinguish between two very different
 // root causes: (a) a genuine PostgreSQL lock wait (one backend blocked on
 // a lock another backend holds — an APPLICATION-level fix, like the
-// lock_timeout/cursor-batching work already done in engines/postgresql/ddlflow), or
+// lock_timeout/cursor-batching work already done in internal/engines/postgresql/ddlflow), or
 // (b) the query was simply slow to EXECUTE — no lock involved at all,
 // e.g. checkpoint I/O pressure, WAL fsync contention, or the test
 // environment's hardware being genuinely saturated by the combined write
@@ -487,7 +487,7 @@ func printReport(strategy string, migrationStart time.Time, before, during []lat
 	// This is the actual diagnosis, not a guess: if pg_locks ever showed a
 	// real blocked/blocking pair, ANY latency outliers above are a
 	// genuine PostgreSQL-level lock wait — an application fix belongs in
-	// engines/postgresql/ddlflow (or wherever the blocking query points to). If
+	// internal/engines/postgresql/ddlflow (or wherever the blocking query points to). If
 	// this stayed empty despite outliers being reported below, the
 	// outliers were NOT caused by a lock at all — the query was simply
 	// slow to execute, which points at the test environment's own

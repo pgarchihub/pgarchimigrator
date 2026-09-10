@@ -3,7 +3,7 @@ import type { IntrospectedSchema } from "../lib/types";
 
 // tableKey is the canonical "schema.table" identifier this component
 // uses internally for its selection Set — matches TableRef's own
-// String() method on the Go side (see engines/postgresql/upgrade.TableRef), kept
+// String() method on the Go side (see internal/engines/postgresql/upgrade.TableRef), kept
 // as a single joined string here purely because Set<string> is simpler
 // to work with than a Set of object values (which compare by
 // reference, not value, in JavaScript).
@@ -17,7 +17,7 @@ export function tableKey(schema: string, table: string): string {
 // Deliberately emits a flat Set of "schema.table" keys, never "this
 // whole schema" as a separate concept — see NewUpgrade.tsx's own
 // comment on why the selection is always expanded to an explicit table
-// list before submission (matching engines/postgresql/upgrade.Job.Tables' own
+// list before submission (matching internal/engines/postgresql/upgrade.Job.Tables' own
 // doc comment on the same design decision, mirrored here).
 export function SchemaTablePicker({
   schemas,

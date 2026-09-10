@@ -354,7 +354,7 @@ func TestStartMigration_TableStatsFetchError_ReturnsError(t *testing.T) {
 // direct regression guard for a real gap this whole feature exists to
 // close: before VersionCheck existed, StartMigration never validated
 // PostgreSQL's version for DIRECT_DDL/EXPAND_BACKFILL migrations at
-// all — only the SHADOW_TABLE-specific preflight check (engines/postgresql/db's
+// all — only the SHADOW_TABLE-specific preflight check (internal/engines/postgresql/db's
 // PgxPreflighter) enforced TR-11's minimum version, meaning every OTHER
 // strategy ran completely unchecked against it.
 func TestStartMigration_VersionCheckFails_RefusesBeforeCreatingAJob(t *testing.T) {

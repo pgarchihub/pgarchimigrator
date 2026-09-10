@@ -42,8 +42,8 @@ require (
 	modernc.org/token v1.1.0 // indirect
 )
 
-// NOTE: github.com/jackc/pglogrepl is used by engines/postgresql/shadowflow/decoder.go
-// and engines/postgresql/shadowflow/replication.go but is deliberately NOT pinned to a
+// NOTE: github.com/jackc/pglogrepl is used by internal/engines/postgresql/shadowflow/decoder.go
+// and internal/engines/postgresql/shadowflow/replication.go but is deliberately NOT pinned to a
 // specific version here — guessing a pseudo-version string risks an
 // unresolvable "unknown revision" error that this sandboxed environment
 // cannot verify against the real module proxy. Run `go mod tidy` (or

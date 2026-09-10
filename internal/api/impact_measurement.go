@@ -5,8 +5,8 @@ import (
 	"log"
 	"sync"
 
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/db"
-	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/progress"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/db"
+	"github.com/pgarchihub/pgarchimigrator/internal/engines/postgresql/progress"
 	"github.com/pgarchihub/pgarchimigrator/internal/state"
 )
 

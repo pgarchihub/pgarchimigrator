@@ -93,7 +93,7 @@ func TestBuildMigrationRequest_AddForeignKey_ValidRequest_CopiesEveryField(t *te
 // TestBuildMigrationRequest_AddForeignKey_InvalidOnDelete_Rejected is the
 // direct regression test for buildMigrationRequest's own reasoning
 // section — this isn't currently validated at this layer (only at
-// internal/orchestrator.StartMigration and engines/postgresql/ddlflow's execute
+// internal/orchestrator.StartMigration and internal/engines/postgresql/ddlflow's execute
 // functions), documenting that gap explicitly rather than silently
 // assuming coverage exists here too.
 func TestBuildMigrationRequest_AddForeignKey_InvalidOnDelete_NotRejectedAtThisLayer(t *testing.T) {

@@ -8,7 +8,7 @@
 ## Why This Document Exists
 
 The ask: reorganize the codebase so PostgreSQL-specific code lives under
-`engines/postgresql/`, in a way that's eventually "plug and play" for a
+`internal/engines/postgresql/`, in a way that's eventually "plug and play" for a
 second engine (MySQL, mentioned as a directional standard — not a
 concrete near-term plan, confirmed directly).
 
@@ -17,7 +17,7 @@ two different risk levels:
 
 1. **A mechanical package move** (low risk, done now) — physically
    relocate packages that are genuinely PostgreSQL-specific into
-   `engines/postgresql/`, updating import paths. No new abstractions
+   `internal/engines/postgresql/`, updating import paths. No new abstractions
    invented.
 2. **Explicitly NOT done now**: designing a generic `Engine` Go
    interface/contract that PostgreSQL code is forced through. See
@@ -47,9 +47,9 @@ own** — cross-checked by hand:
 
 ## Final Package Classification
 
-### Moves to `engines/postgresql/`
+### Moves to `internal/engines/postgresql/`
 
-| Package (now under `engines/postgresql/`) | Why it's engine-specific |
+| Package (now under `internal/engines/postgresql/`) | Why it's engine-specific |
 |---|---|
 | `catalog` | Queries `pg_catalog`/`information_schema` directly via pgx |
 | `db` | pgx connection pooling, PostgreSQL version detection |
@@ -95,7 +95,7 @@ Splitting this properly would require either:
     the interface-design question this plan is deliberately deferring.
 
 **Decision: `internal/api` does not move or split in this pass.** It
-keeps importing what's now `engines/postgresql/...` by its new import
+keeps importing what's now `internal/engines/postgresql/...` by its new import
 path. `resource_status.go` and `upgrade_handlers.go` stay exactly
 where they are, engine coupling and all. This is an honest, visible
 seam — the codebase will say "the API layer still assumes PostgreSQL"
@@ -115,7 +115,7 @@ work. Building the abstraction now means paying for a rewrite later
 when MySQL work starts for real and the guessed boundary doesn't fit.
 
 **What this plan does instead**: the package move itself creates a
-clean physical seam (`engines/postgresql/` as a sibling directory any
+clean physical seam (`internal/engines/postgresql/` as a sibling directory any
 future `engines/mysql/` would sit next to) without committing to any
 Go interface shape. When MySQL work is actually greenlit, the interface
 gets designed then, informed by two real implementations instead of
@@ -124,12 +124,12 @@ inventory of "things a second engine would need to also provide."
 
 ## Execution Plan (Mechanical Move)
 
-1. **Create `engines/postgresql/` and move the 10 packages listed
+1. **Create `internal/engines/postgresql/` and move the 10 packages listed
    above** via `git mv`, preserving history.
 2. **Update every import path** referencing
    `github.com/pgarchihub/pgarchimigrator/internal/{catalog,db,ddlflow,
    shadowflow,upgrade,preview,progress,reaper,typecompat,monitor}` to
-   `.../engines/postgresql/...` — across `internal/api`,
+   `.../internal/engines/postgresql/...` — across `internal/api`,
    `cmd/pgarchimigrator`, and each moved package's own internal
    cross-references.
 3. **Update package doc comments** in each moved package to reflect

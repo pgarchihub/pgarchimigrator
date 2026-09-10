@@ -65,12 +65,12 @@ const (
 	EventTypeMigrationPhaseChanged EventType = ProductID + ".migration.phase_changed.v1"
 
 	// Upgrade* mirrors the Migration* set above exactly, one domain
-	// segment over ("upgrade" rather than "migration") — engines/postgresql/upgrade
+	// segment over ("upgrade" rather than "migration") — internal/engines/postgresql/upgrade
 	// is its own package with its own Job/Phase (see that package's own
 	// doc comment for why), but the ecosystem-facing event shape it
 	// publishes follows this package's already-established convention
 	// rather than inventing a different one. There is no
-	// EventTypeUpgradeStarted distinct from Requested: engines/postgresql/upgrade's
+	// EventTypeUpgradeStarted distinct from Requested: internal/engines/postgresql/upgrade's
 	// own CreateJob synchronously sets the job's first real phase
 	// (PhaseIntrospecting) before returning — unlike a migration job,
 	// where Requested (Create) and Started (the first phase transition)
