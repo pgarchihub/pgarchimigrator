@@ -795,10 +795,24 @@ func (f *DDLFlow) createGeneratedColumnSyncTrigger(ctx context.Context, job *sta
 	// CREATE OR REPLACE + DROP TRIGGER IF EXISTS before CREATE TRIGGER —
 	// same retry-safety reasoning as createRenameSyncTrigger's identical
 	// pattern.
+	// job.GeneratedExpression is a raw, user-supplied expression (e.g.
+	// "price * quantity") with no NEW. qualification — dropping it
+	// straight into "NEW.col := <expression>" fails with "column price
+	// does not exist", because inside a plpgsql function body, bare
+	// column names are resolved against plpgsql's own variable
+	// namespace (NEW/OLD themselves, and any DECLAREd variables), not
+	// automatically against NEW's own fields. Routing the expression
+	// through a SQL subquery over "(NEW).*" (record expansion) gives it
+	// a real FROM-clause row to resolve bare column names against —
+	// this is the standard, safe way to evaluate an arbitrary
+	// expression against a trigger's NEW row without parsing/rewriting
+	// the expression text itself (which would be far more fragile:
+	// string literals, function calls, and qualified names could all
+	// be mis-rewritten by a naive "prefix every identifier" pass).
 	createFnDDL := fmt.Sprintf(`
 		CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $pgam$
 		BEGIN
-			NEW.%s := %s;
+			NEW.%s := (SELECT %s FROM (SELECT (NEW).*) AS __pgam_new_row);
 			RETURN NEW;
 		END;
 		$pgam$ LANGUAGE plpgsql

@@ -4,7 +4,7 @@
 //
 //	docker compose -f deploy/docker-compose.dev.yml up -d
 //	go test ./internal/api/... -tags=integration -v -run ResourceStatus
-package api_test
+package api
 
 import (
 	"context"
@@ -18,7 +18,6 @@ import (
 
 	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/progress"
 	"github.com/pgarchihub/pgarchimigrator/engines/postgresql/shadowflow"
-	"github.com/pgarchihub/pgarchimigrator/internal/api"
 	"github.com/pgarchihub/pgarchimigrator/internal/state"
 )
 
@@ -51,7 +50,7 @@ func connectPoolForResourceStatus(t *testing.T) *pgxpool.Pool {
 // here specifically because attachResourceStatus queries real system
 // catalogs (pg_tables, pg_replication_slots, pg_publication, pg_indexes),
 // unlike everything else server_test.go covers.
-func newTestServerWithRealPool(t *testing.T, pool *pgxpool.Pool, store *fakeStore) (*api.Server, *testUsers) {
+func newTestServerWithRealPool(t *testing.T, pool *pgxpool.Pool, store *fakeStore) (*Server, *testUsers) {
 	t.Helper()
 	srv, users := newTestServer(t, store, &fakeFlow{})
 	// newTestServer's own orchestrator/auth wiring is reused as-is (this

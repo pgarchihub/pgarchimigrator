@@ -4,7 +4,7 @@
 //
 //	docker compose -f deploy/docker-compose.dev.yml up -d
 //	go test ./internal/api/... -tags=integration -v -run ImpactMeasurement
-package api_test
+package api
 
 import (
 	"context"
