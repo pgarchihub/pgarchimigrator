@@ -1,8 +1,21 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
-import { ArrowRightLeft, ChevronDown, ChevronsLeft, ChevronsRight, CircleHelp, Database, Layers, LogOut, Users as UsersIcon } from "lucide-react";
+import { ArrowRightLeft, ChevronDown, ChevronsLeft, ChevronsRight, CircleHelp, Database, type LucideIcon, Layers, LogOut, Users as UsersIcon } from "lucide-react";
 import { useAuth } from "../lib/auth";
 import { Badge } from "../ui/Badge";
+import { navItems } from "../manifestNav";
+
+// Translates manifestNav.ts's own plain-string iconKey (e.g. "layers")
+// back to the real lucide-react component this file renders with — the
+// one place that mapping happens, so manifestNav.ts itself can stay
+// free of a React/JSX dependency (see that file's own doc comment for
+// why that matters: vite.config.ts's manifestPlugin imports the same
+// array at build time, outside any JSX transform).
+const iconMap: Record<string, LucideIcon> = {
+  layers: Layers,
+  database: Database,
+  users: UsersIcon,
+};
 
 // SIDEBAR_COLLAPSED_KEY persists purely as a per-browser UI preference
 // (not app data) — a plain localStorage read/write is the right tool
@@ -12,31 +25,12 @@ import { Badge } from "../ui/Badge";
 // actual production web app.
 const SIDEBAR_COLLAPSED_KEY = "pgarchimigrator_sidebar_collapsed";
 
-// Help intentionally lives in the header, not this list — it's a
-// constant, always-available reference (see NavItem's own role split:
-// header = "always there regardless of what you're doing," sidebar =
-// "which of this app's own tools am I using right now").
-const navItems = [
-  { to: "/", label: "Zero-Downtime Migration", end: true, icon: Layers },
-  // minRole: "operator" — matches GET /api/upgrades' own minimum role
-  // (see internal/api/server.go's routes()); the page itself further
-  // gates the "Start upgrade" action to admin, matching POST
-  // /api/upgrades' own stricter minimum (a whole-database upgrade is a
-  // substantially bigger action than a single-table migration).
-  //
-  // "Database Migration" (not "Data Synchronization") is the displayed
-  // label deliberately — "Synchronization" risks implying an ongoing,
-  // continuous sync (like a CDC/ETL tool), when this is a one-time,
-  // terminal move (Introspecting → ... → Ready, no further syncing
-  // after that); "Database Migration" also keeps naming consistent
-  // with "Zero-Downtime Migration" above (same "Migration" vocabulary,
-  // differentiated by scope: one table in place vs. a whole database
-  // to a different instance). The underlying route (/upgrades) and
-  // backend paths (/api/upgrades) are untouched — this is a display
-  // label only.
-  { to: "/upgrades", label: "Database Migration", minRole: "operator" as const, icon: Database },
-  { to: "/users", label: "Users", minRole: "admin" as const, icon: UsersIcon },
-];
+// Help intentionally lives in the header, not navItems (imported above
+// from ../manifestNav) — it's a constant, always-available reference
+// (see that split: header = "always there regardless of what you're
+// doing," sidebar = "which of this app's own tools am I using right
+// now"). manifestNav.ts's own doc comment explains why navItems itself
+// moved out of this file — Shell.tsx is no longer its only consumer.
 
 export function Shell({ children }: { children: ReactNode }) {
   const { user, logout, hasRole } = useAuth();
@@ -241,7 +235,7 @@ export function Shell({ children }: { children: ReactNode }) {
 
           <ul className="flex flex-1 flex-col gap-0.5 p-2">
             {visibleNavItems.map((item) => {
-              const Icon = item.icon;
+              const Icon = iconMap[item.iconKey];
               return (
                 <li key={item.to}>
                   <NavLink

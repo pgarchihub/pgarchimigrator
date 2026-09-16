@@ -1,11 +1,58 @@
 /// <reference types="vitest/config" />
-import { defineConfig } from "vite";
+import { writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
+import { navItems, manifestRoutes } from "./src/manifestNav";
+
+// manifestPlugin emits dist/manifest.json at the end of every production
+// build — the UI-facing manifest AC-PF-004 (the reconstructed Dual-Shell
+// Technical Specification, docs/ecosystem/) §6 describes, served at
+// GET /app/manifest.json once dist/ is deployed (base: "/app/" below).
+// Deliberately generated from src/manifestNav.ts (the same data
+// Shell.tsx renders its own sidebar from) rather than hand-maintained
+// separately — one source of truth, no drift between what the sidebar
+// shows and what this manifest advertises.
+//
+// This is deliberately the ONLY piece of AC-PF-004 implemented so far —
+// see that document's own Reconstruction Notice and this project's own
+// COMPAT_BRIDGE_DESIGN.md-adjacent decision log: a full Module
+// Federation / mount() / ArchiContext integration was considered and
+// deliberately deferred until a real second party (an actual
+// ArchiConsole instance, or at least a concrete embedding test target)
+// exists to validate the contract against — the same "don't build an
+// interface only one side has ever used" principle applied to this
+// project's ENGINE_MIGRATION_PLAN.md decision not to build a generic
+// Engine interface before a second real engine existed. Publishing
+// this manifest costs nothing and needs no counterpart to be useful
+// (it's just data), unlike an actual mount()/postMessage contract.
+function manifestPlugin(): Plugin {
+  return {
+    name: "pgarchimigrator-manifest",
+    apply: "build",
+    closeBundle() {
+      const manifest = {
+        productId: "pgarchimigrator",
+        displayName: "pgArchiMigrator",
+        ui: {
+          nav: navItems.map((item) => ({
+            label: item.label,
+            route: item.to,
+            icon: item.iconKey,
+            ...(item.minRole ? { requiresRole: item.minRole } : {}),
+          })),
+          routes: manifestRoutes,
+        },
+      };
+      writeFileSync(resolve(__dirname, "dist/manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
+    },
+  };
+}
 
 // build.outDir is picked up by internal/api's //go:embed directive —
 // keep this in sync with cmd/pgarchimigrator's expectations if it ever moves.
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), manifestPlugin()],
   // The SPA is served under /app (not the domain root — see
   // internal/api/server.go's webappFS doc comment for why), so every
   // asset reference the build emits (index.html's <script>/<link> tags,
