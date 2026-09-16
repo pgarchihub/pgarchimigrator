@@ -300,17 +300,14 @@ func (f *DDLFlow) executeExpandBackfill(ctx context.Context, job *state.Job) err
 	return f.setPhase(ctx, job, state.PhaseCompleted)
 }
 
-// deprecatedColumnName builds the temporary name a column is renamed to
-// during executeDropColumn's soft-drop step. Includes a short slice of the
-// job ID so two DROP_COLUMN jobs on the same table/column (e.g. a retry
-// after a failure) never collide.
-func deprecatedColumnName(job *state.Job) string {
-	shortID := job.ID
-	if len(shortID) > 12 {
-		shortID = shortID[:12]
-	}
-	return fmt.Sprintf("%s%s_%s", DeprecatedColumnPrefix, job.ColumnName, shortID)
-}
+// deprecatedColumnName is no longer called by executeDropColumn (see that
+// function's own doc comment — the compat-bridge redesign defers the
+// actual rename/drop entirely rather than renaming immediately), but
+// DeprecatedColumnPrefix above stays: internal/engines/postgresql/reaper's
+// finalizeDropColumn still checks for it as a defense-in-depth match
+// against any job created before this redesign (whose DeprecatedColumnName
+// really would carry this prefix, from when executeDropColumn actually
+// renamed the column at drop time).
 
 // executeDropColumn implements a two-phase DROP_COLUMN: an immediate,
 // fully reversible "soft drop" followed by a rollback window, mirroring
@@ -330,22 +327,36 @@ func deprecatedColumnName(job *state.Job) string {
 // Once the window expires without a Rollback call, internal/engines/postgresql/reaper's
 // finalizeDropColumn performs the actual, irreversible
 // ALTER TABLE ... DROP COLUMN.
+// executeDropColumn implements the compat-bridge approach to DROP_COLUMN:
+// deliberately defers the physical DROP entirely rather than renaming the
+// column away immediately. An old, unaware caller still querying the
+// original column name keeps working with zero disruption for as long as
+// the rollback window is open — the column's real name and type are
+// untouched, nothing about it changes yet.
+//
+// job.DeprecatedColumnName is set to job.ColumnName itself (not a
+// "deprecated_" prefixed name) — deliberately reusing this existing field
+// rather than adding a new one/a new state.Store method (which would mean
+// a SQLite schema migration and updating every fakeStore implementation
+// across the codebase for one field). Reaper.finalizeDropColumn's own
+// safety check (see that function's doc comment) already accepts this
+// case explicitly: a DeprecatedColumnName equal to job.ColumnName means
+// "never renamed, drop it under its own name" rather than "renamed to a
+// deprecated_ name, drop that."
+//
+// Once the rollback window closes without the operator calling Rollback,
+// internal/engines/postgresql/reaper.finalizeDropColumn runs the actual
+// DROP COLUMN — see that function's own doc comment for why no rename
+// happens there either.
 func (f *DDLFlow) executeDropColumn(ctx context.Context, job *state.Job) error {
 	if err := f.setPhase(ctx, job, state.PhasePreparation); err != nil {
 		return err
 	}
 
-	deprecatedName := deprecatedColumnName(job)
-	ddl := fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
-		qualifiedTable(job), quoteIdent(job.ColumnName), quoteIdent(deprecatedName))
-	if err := execDDLWithLockTimeout(ctx, f.Pool, ddl); err != nil {
-		return f.fail(ctx, job, fmt.Errorf("failed to soft-drop (rename) column: %w", err))
+	if err := f.Store.UpdateDeprecatedColumnName(ctx, job.ID, job.ColumnName); err != nil {
+		return f.fail(ctx, job, fmt.Errorf("failed to persist the pending-drop column name: %w", err))
 	}
-
-	if err := f.Store.UpdateDeprecatedColumnName(ctx, job.ID, deprecatedName); err != nil {
-		return f.fail(ctx, job, fmt.Errorf("failed to persist the deprecated column name: %w", err))
-	}
-	job.DeprecatedColumnName = deprecatedName
+	job.DeprecatedColumnName = job.ColumnName
 
 	deadline := time.Now().UTC().Add(f.dropColumnRollbackWindow())
 	if err := f.Store.UpdateRollbackDeadline(ctx, job.ID, deadline); err != nil {
@@ -1437,8 +1448,11 @@ func (f *DDLFlow) rollbackAddColumn(ctx context.Context, job *state.Job) error {
 	return f.setPhase(ctx, job, state.PhaseAborted)
 }
 
-// rollbackDropColumn reverses a DROP_COLUMN soft-drop by renaming the
-// deprecated column back to its original name.
+// rollbackDropColumn reverses a DROP_COLUMN soft-drop. Unlike the
+// previous design, there is no rename to undo — the compat-bridge
+// approach (see executeDropColumn's own doc comment) never touches the
+// column's real name at all, so "rolling back" is just abandoning the
+// pending-drop intent: no DDL runs here.
 func (f *DDLFlow) rollbackDropColumn(ctx context.Context, job *state.Job) error {
 	if job.Phase != state.PhaseRollbackWindow {
 		return fmt.Errorf("ddlflow: cannot roll back DROP_COLUMN job in phase %s (expected ROLLBACK_WINDOW) — "+
@@ -1451,13 +1465,7 @@ func (f *DDLFlow) rollbackDropColumn(ctx context.Context, job *state.Job) error 
 			job.RollbackDeadline.Format(time.RFC3339))
 	}
 	if job.DeprecatedColumnName == "" {
-		return fmt.Errorf("ddlflow: job has no recorded deprecated column name — cannot determine what to rename back")
-	}
-
-	ddl := fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
-		qualifiedTable(job), quoteIdent(job.DeprecatedColumnName), quoteIdent(job.ColumnName))
-	if err := execDDLWithLockTimeout(ctx, f.Pool, ddl); err != nil {
-		return fmt.Errorf("rollback (restore column name) failed: %w", err)
+		return fmt.Errorf("ddlflow: job has no recorded pending-drop column name — nothing to roll back")
 	}
 	return f.setPhase(ctx, job, state.PhaseAborted)
 }

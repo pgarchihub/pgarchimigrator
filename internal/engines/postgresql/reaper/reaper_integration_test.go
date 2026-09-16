@@ -455,6 +455,67 @@ func TestSweepExpiredRollbackWindows_FinalizesDropColumn(t *testing.T) {
 	}
 }
 
+// TestSweepExpiredRollbackWindows_FinalizesDropColumn_CurrentDesign covers
+// the current compat-bridge design (see ddlflow.DDLFlow.executeDropColumn's
+// own doc comment) — unlike the legacy-job test just above, DeprecatedColumnName
+// here equals ColumnName itself (never renamed during the rollback window),
+// so finalize must drop the column under its own, real, unchanged name.
+func TestSweepExpiredRollbackWindows_FinalizesDropColumn_CurrentDesign(t *testing.T) {
+	pool := connectPool(t)
+	ctx := context.Background()
+
+	tableName := "sweep_dropcolumn_current_table"
+
+	_, _ = pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName))
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s (id BIGINT PRIMARY KEY, status TEXT)
+	`, tableName)); err != nil {
+		t.Fatalf("could not create test table: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName))
+	})
+
+	store := newTestStore(t)
+	expiredDeadline := time.Now().Add(-1 * time.Minute)
+	job := &state.Job{
+		ID: "sweep-dropcol-current-1", SchemaName: "public", TableName: tableName,
+		Strategy: "DIRECT_DDL", Phase: state.PhaseRollbackWindow,
+		Operation: "DROP_COLUMN", ColumnName: "status",
+		DeprecatedColumnName: "status", // never renamed — see executeDropColumn's doc comment
+		RollbackDeadline:     &expiredDeadline,
+	}
+	if err := store.Create(ctx, job); err != nil {
+		t.Fatalf("could not create job: %v", err)
+	}
+
+	r := reaper.New(store, pool)
+	result, err := r.SweepExpiredRollbackWindows(ctx)
+	if err != nil {
+		t.Fatalf("SweepExpiredRollbackWindows failed: %v (result: %+v)", err, result)
+	}
+	if result.JobsSwept != 1 {
+		t.Errorf("expected 1 job to be swept, got %d", result.JobsSwept)
+	}
+
+	var colExists bool
+	checkQuery := `SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2)`
+	if err := pool.QueryRow(ctx, checkQuery, tableName, "status").Scan(&colExists); err != nil {
+		t.Fatalf("column check failed: %v", err)
+	}
+	if colExists {
+		t.Error("expected the column to have actually been dropped by the sweep")
+	}
+
+	got, err := store.Get(ctx, "sweep-dropcol-current-1")
+	if err != nil {
+		t.Fatalf("could not read job: %v", err)
+	}
+	if got.Phase != state.PhaseCompleted {
+		t.Errorf("expected Phase=COMPLETED (a successful drop, not an orphan), got %s", got.Phase)
+	}
+}
+
 // quoteTestIdent is a minimal identifier quoter for building test SQL —
 // the deprecated column names used in these tests are always
 // test-controlled, safe strings, so this is deliberately simpler than

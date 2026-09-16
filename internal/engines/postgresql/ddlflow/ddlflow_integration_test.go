@@ -507,20 +507,22 @@ func TestExecute_DropColumn_SoftDropEntersRollbackWindow(t *testing.T) {
 		t.Fatal("expected a rollback deadline to be set")
 	}
 
-	// The original column name must no longer be reachable — this is the
-	// intended forcing function (see executeDropColumn's doc comment).
-	if _, err := pool.Exec(context.Background(), fmt.Sprintf(`SELECT existing_col FROM %s LIMIT 1`, tableName)); err == nil {
-		t.Error("expected the original column name to no longer exist after soft-drop")
+	// The compat-bridge design (see executeDropColumn's own doc comment)
+	// deliberately never renames the column during the rollback window —
+	// this is the whole point: an old, unaware caller still querying the
+	// original name keeps working with zero disruption for as long as the
+	// window is open. DeprecatedColumnName is bookkeeping only here, equal
+	// to the column's own real, unchanged name.
+	if job.DeprecatedColumnName != job.ColumnName {
+		t.Errorf("expected DeprecatedColumnName to equal the unchanged real column name %q, got %q", job.ColumnName, job.DeprecatedColumnName)
 	}
-
-	// But the data must still be fully intact under the deprecated name.
 	var count int
-	checkQuery := fmt.Sprintf(`SELECT count(*) FROM %s WHERE "%s" IS NOT NULL`, tableName, job.DeprecatedColumnName)
+	checkQuery := fmt.Sprintf(`SELECT count(*) FROM %s WHERE existing_col IS NOT NULL`, tableName)
 	if err := pool.QueryRow(context.Background(), checkQuery).Scan(&count); err != nil {
-		t.Fatalf("could not query the deprecated column: %v", err)
+		t.Fatalf("expected the original column name to still be queryable during the rollback window: %v", err)
 	}
 	if count != 5 {
-		t.Errorf("expected 5 rows with non-null data under the deprecated column name, got %d", count)
+		t.Errorf("expected 5 rows with non-null data under the original column name, got %d", count)
 	}
 
 	// Also verify the checkpoint persisted everything correctly.

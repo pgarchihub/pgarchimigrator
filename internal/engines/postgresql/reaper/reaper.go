@@ -218,16 +218,27 @@ func (r *Reaper) SweepExpiredRollbackWindows(ctx context.Context) (*SweepResult,
 // DDLFlow.executeDropColumn) — only once this runs is the column's data
 // actually gone.
 //
-// Defense in depth: this only proceeds if job.DeprecatedColumnName is
-// both non-empty AND carries the expected naming convention prefix (see
-// ddlflow.DeprecatedColumnPrefix) — a sanity check against ever dropping
-// the wrong column due to a corrupted or unexpected state record.
+// Since the compat-bridge redesign, executeDropColumn never renames the
+// column — DeprecatedColumnName is set to the column's own real name
+// (job.ColumnName), and this function drops it under that name directly,
+// no rename involved. Older jobs created before this redesign are still
+// handled: their DeprecatedColumnName really does carry the
+// ddlflow.DeprecatedColumnPrefix prefix (from when executeDropColumn
+// renamed the column at drop time, before the rollback window), and this
+// function drops that prefixed name instead.
+//
+// Defense in depth either way: this only proceeds if job.DeprecatedColumnName
+// is non-empty AND is either (a) identical to job.ColumnName (the current,
+// never-renamed design) or (b) carries the expected ddlflow.DeprecatedColumnPrefix
+// naming convention (an older, already-renamed job) — a sanity check
+// against ever dropping the wrong column due to a corrupted or unexpected
+// state record.
 func (r *Reaper) finalizeDropColumn(ctx context.Context, job *state.Job) error {
 	if job.DeprecatedColumnName == "" {
 		return fmt.Errorf("job has no recorded deprecated column name — refusing to guess what to drop")
 	}
-	if !strings.HasPrefix(job.DeprecatedColumnName, ddlflow.DeprecatedColumnPrefix) {
-		return fmt.Errorf("deprecated column name %q does not match the expected naming convention — refusing to drop it", job.DeprecatedColumnName)
+	if job.DeprecatedColumnName != job.ColumnName && !strings.HasPrefix(job.DeprecatedColumnName, ddlflow.DeprecatedColumnPrefix) {
+		return fmt.Errorf("deprecated column name %q matches neither the current column name nor the expected legacy naming convention — refusing to drop it", job.DeprecatedColumnName)
 	}
 
 	ddl := fmt.Sprintf("ALTER TABLE %s.%s DROP COLUMN IF EXISTS %s",
