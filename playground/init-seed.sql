@@ -39,3 +39,9 @@ SELECT
 FROM generate_series(1, 5000000) AS i;
 
 ANALYZE orders;
+
+-- Diagnostic only — prints the real row count into this container's
+-- own log (docker compose logs pg), so a failure in this seed step
+-- shows the actual outcome directly rather than requiring a guess at
+-- why a later, separate row-count check saw something unexpected.
+SELECT count(*) AS seeded_row_count FROM orders;
