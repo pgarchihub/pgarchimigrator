@@ -1,7 +1,7 @@
 # pgArchiMigrator
 
 [![CI](https://github.com/pgarchihub/pgarchimigrator/actions/workflows/ci.yml/badge.svg)](https://github.com/pgarchihub/pgarchimigrator/actions/workflows/ci.yml)
-![Version](https://img.shields.io/badge/version-v2.0.0-blue)
+![Version](https://img.shields.io/badge/version-v2.1.0-blue)
 ![Edition](https://img.shields.io/badge/edition-Community-2f7d73)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-12--18-blue)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/pgarchihub/pgarchimigrator/blob/main/LICENSE)
