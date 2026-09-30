@@ -385,11 +385,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
-            echo "=== docker compose up output (if it ran) ==="
-            cat /tmp/compose-up-output.txt 2>/dev/null || echo "(no compose-up output file)"
-            echo ""
-            echo "=== docker compose logs ==="
-            docker compose logs 2>&1
+            # NOT docker's own image-pull progress (/tmp/compose-up-output.txt)
+            # or every service's logs — both were pushing the real,
+            # useful output (this step's own psql/curl results, below)
+            # out of the 60KB trim budget entirely on the previous
+            # real run of this job. Just pg's own log (includes
+            # postgres's own initdb.d script output — the actual
+            # INSERT result/error this failure needs) and bootstrap's.
+            echo "=== docker compose logs (pg, bootstrap only) ==="
+            docker compose logs pg bootstrap 2>&1
             echo ""
             # Deliberately LAST — tail -c 60000 below keeps a file's
             # own tail end over its start when the combined output
