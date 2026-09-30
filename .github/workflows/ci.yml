@@ -291,12 +291,16 @@ jobs:
       - name: Verify the seed actually produced 5,000,000 rows
         working-directory: playground
         run: |
+          exec > >(tee -a /tmp/playground-all-output.txt) 2>&1
+          echo "--- Verify the seed actually produced 5,000,000 rows ---"
           COUNT=$(docker compose exec -T pg psql -U pgarchimigrator -d playground -tAc "SELECT count(*) FROM orders;")
           echo "orders row count: $COUNT"
           [ "$COUNT" = "5000000" ] || (echo "expected 5000000 rows, got $COUNT" && exit 1)
 
       - name: Log in as the auto-created admin
         run: |
+          exec > >(tee -a /tmp/playground-all-output.txt) 2>&1
+          echo "--- Log in as the auto-created admin ---"
           JAR=/tmp/playground-cookies.txt
           curl -s -c "$JAR" -X POST http://localhost:8080/api/auth/login \
             -H "Content-Type: application/json" \
@@ -306,6 +310,8 @@ jobs:
 
       - name: "Start the zero-downtime ALTER COLUMN TYPE (id: integer -> bigint) and time it to SWAPPING completion"
         run: |
+          exec > >(tee -a /tmp/playground-all-output.txt) 2>&1
+          echo "--- Start the zero-downtime ALTER COLUMN TYPE ---"
           JAR=/tmp/playground-cookies.txt
           START=$(date +%s)
 
@@ -358,6 +364,8 @@ jobs:
       - name: Verify the column type actually changed
         working-directory: playground
         run: |
+          exec > >(tee -a /tmp/playground-all-output.txt) 2>&1
+          echo "--- Verify the column type actually changed ---"
           TYPE=$(docker compose exec -T pg psql -U pgarchimigrator -d playground -tAc "SELECT data_type FROM information_schema.columns WHERE table_name = 'orders' AND column_name = 'id';")
           echo "orders.id data_type: $TYPE"
           echo "$TYPE" | grep -qi "bigint" || (echo "orders.id is not bigint after the migration" && exit 1)
@@ -382,6 +390,16 @@ jobs:
             echo ""
             echo "=== docker compose logs ==="
             docker compose logs 2>&1
+            echo ""
+            # Deliberately LAST — tail -c 60000 below keeps a file's
+            # own tail end over its start when the combined output
+            # exceeds the trim budget, and this is the output most
+            # worth keeping if something has to give (the seed
+            # verification, login, and migration steps' own output —
+            # docker's own image-pull progress above is comparatively
+            # uninteresting once something here has actually failed).
+            echo "=== seed verification / login / migration steps' own output (if they ran) ==="
+            cat /tmp/playground-all-output.txt 2>/dev/null || echo "(no playground-all-output file)"
           } > /tmp/playground-logs.txt
           tail -c 60000 /tmp/playground-logs.txt > /tmp/playground-logs-trimmed.txt
           python3 -c "import json; logs = open('/tmp/playground-logs-trimmed.txt').read(); json.dump({'body': '## playground-smoke failure logs\n\n' + chr(96)*3 + '\n' + logs + '\n' + chr(96)*3}, open('/tmp/playground-comment.json', 'w'))"
