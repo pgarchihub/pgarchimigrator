@@ -250,3 +250,141 @@ jobs:
             $errors | ForEach-Object { Write-Error $_ }
             exit 1
           }
+
+  # --- Playground: the "90-second" Community demo ------------------------
+  playground-smoke:
+    name: Playground / real timing measurement + zero-downtime demo
+    runs-on: ubuntu-latest
+    # Real, measured verification that playground/docker-compose.yml
+    # actually works end to end and that the "90 seconds" framing holds
+    # up — this sandbox this repo is developed in has no docker daemon,
+    # so this job is the only place any of this is verified for real
+    # rather than by careful reading alone (same constraint and same
+    # commit-comment log-capture pattern already established in
+    # pgarchimigrator-enterprise's own testenv-smoke job).
+    #
+    # "90 seconds" is measured to the SWAPPING phase completing — the
+    # actual zero-downtime moment (orders.id genuinely becomes bigint,
+    # live) — not to the job's own terminal COMPLETED state, which only
+    # arrives after FR-08a's own 10-minute ROLLBACK_WINDOW safety period
+    # (internal/engines/postgresql/shadowflow's own defaultRollbackWindow,
+    # not configurable via any env var or flag — verified by reading
+    # that package, not assumed). That 10-minute window is a real,
+    # intentional safety feature, but it runs unattended in the
+    # background and is not what a viewer watching this demo needs to
+    # sit through to see the actual zero-downtime result.
+    permissions:
+      contents: write # needed for the failure-diagnostics commit-comment step below
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: docker compose up (timed)
+        working-directory: playground
+        run: |
+          START=$(date +%s)
+          docker compose up -d --wait
+          END=$(date +%s)
+          echo "COMPOSE_UP_SECONDS=$((END - START))" >> "$GITHUB_ENV"
+          echo "docker compose up -d --wait took $((END - START))s"
+
+      - name: Verify the seed actually produced 5,000,000 rows
+        working-directory: playground
+        run: |
+          COUNT=$(docker compose exec -T pg psql -U pgarchimigrator -d playground -tAc "SELECT count(*) FROM orders;")
+          echo "orders row count: $COUNT"
+          [ "$COUNT" = "5000000" ] || (echo "expected 5000000 rows, got $COUNT" && exit 1)
+
+      - name: Log in as the auto-created admin
+        run: |
+          JAR=/tmp/playground-cookies.txt
+          curl -s -c "$JAR" -X POST http://localhost:8080/api/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"email":"admin@example.com","password":"playground123"}' > /tmp/login-response.json
+          cat /tmp/login-response.json
+          grep -q '"email":"admin@example.com"' /tmp/login-response.json || (echo "login did not return the expected user" && exit 1)
+
+      - name: "Start the zero-downtime ALTER COLUMN TYPE (id: integer -> bigint) and time it to SWAPPING completion"
+        run: |
+          JAR=/tmp/playground-cookies.txt
+          START=$(date +%s)
+
+          RESPONSE=$(curl -s -c "$JAR" -b "$JAR" -X POST http://localhost:8080/api/migrations \
+            -H "Content-Type: application/json" \
+            -d '{"table":"orders","operation":"ALTER_COLUMN_TYPE","column":"id","type":"bigint","actor":"playground-ci"}')
+          echo "start response: $RESPONSE"
+          JOB_ID=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])" 2>/dev/null || echo "")
+          if [ -z "$JOB_ID" ]; then
+            echo "could not extract a job id from the start-migration response"
+            exit 1
+          fi
+          echo "job id: $JOB_ID"
+
+          # Poll until CurrentPhase moves past SWAPPING (into
+          # ROLLBACK_WINDOW, or straight to COMPLETED/FAILED/ABORTED if
+          # this build's own timing makes the window race by) — see
+          # this job's own top-level comment for why SWAPPING, not
+          # COMPLETED, is the right thing to measure against.
+          PHASE=""
+          for i in $(seq 1 120); do
+            REPORT=$(curl -s -c "$JAR" -b "$JAR" "http://localhost:8080/api/migrations/$JOB_ID")
+            PHASE=$(echo "$REPORT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('CurrentPhase',''))" 2>/dev/null || echo "")
+            echo "  [$i] phase: $PHASE"
+            case "$PHASE" in
+              ROLLBACK_WINDOW|COMPLETED)
+                break
+                ;;
+              FAILED|ABORTED)
+                echo "migration ended in $PHASE — full report:"
+                echo "$REPORT"
+                exit 1
+                ;;
+            esac
+            sleep 1
+          done
+
+          END=$(date +%s)
+          echo "MIGRATION_SECONDS=$((END - START))" >> "$GITHUB_ENV"
+          echo "reached phase $PHASE after $((END - START))s"
+
+          case "$PHASE" in
+            ROLLBACK_WINDOW|COMPLETED) ;;
+            *)
+              echo "never reached ROLLBACK_WINDOW or COMPLETED within the poll budget (last phase: $PHASE)"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify the column type actually changed
+        working-directory: playground
+        run: |
+          TYPE=$(docker compose exec -T pg psql -U pgarchimigrator -d playground -tAc "SELECT data_type FROM information_schema.columns WHERE table_name = 'orders' AND column_name = 'id';")
+          echo "orders.id data_type: $TYPE"
+          echo "$TYPE" | grep -qi "bigint" || (echo "orders.id is not bigint after the migration" && exit 1)
+
+      - name: Report real measured timing
+        run: |
+          TOTAL=$((COMPOSE_UP_SECONDS + MIGRATION_SECONDS))
+          echo "### Playground real measured timing" >> "$GITHUB_STEP_SUMMARY"
+          echo "- docker compose up (incl. 5M-row seed): ${COMPOSE_UP_SECONDS}s" >> "$GITHUB_STEP_SUMMARY"
+          echo "- login + start migration + reach zero-downtime swap: ${MIGRATION_SECONDS}s" >> "$GITHUB_STEP_SUMMARY"
+          echo "- total: ${TOTAL}s" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dump logs and post as a commit comment on failure
+        if: failure()
+        working-directory: playground
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker compose logs > /tmp/playground-logs.txt 2>&1
+          tail -c 60000 /tmp/playground-logs.txt > /tmp/playground-logs-trimmed.txt
+          python3 -c "import json; logs = open('/tmp/playground-logs-trimmed.txt').read(); json.dump({'body': '## playground-smoke failure logs\n\n' + chr(96)*3 + '\n' + logs + '\n' + chr(96)*3}, open('/tmp/playground-comment.json', 'w'))"
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+            -d @/tmp/playground-comment.json
+
+      - name: Tear down
+        if: always()
+        working-directory: playground
+        run: docker compose down -v

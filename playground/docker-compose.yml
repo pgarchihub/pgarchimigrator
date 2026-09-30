@@ -1,0 +1,107 @@
+# pgArchiMigrator Community — 90-second playground
+# =============================================================================
+# One command, one real scenario: watch a zero-downtime ALTER COLUMN TYPE
+# (orders.id: integer -> bigint — the single most common real-world reason
+# teams reach for this: running out of int32 room on a primary key) run
+# against a pre-seeded 5,000,000-row table.
+#
+#   docker compose up -d
+#
+# Then open http://localhost:8080 — see playground/README.md for the admin
+# login (created automatically by the "bootstrap" service below, no signup
+# step) and the exact click path to start the migration.
+#
+# No local build step: pulls the same published image
+# ghcr.io/pgarchihub/pgarchimigrator:latest this repo's own README's
+# "Quick Start (Docker)" section uses — the only thing built specifically
+# for this playground is the seed data (playground/init-seed.sql, loaded by
+# postgres's own /docker-entrypoint-initdb.d mechanism on first start).
+
+services:
+  pg:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: pgarchimigrator
+      POSTGRES_PASSWORD: pgarchimigrator_playground_only
+      POSTGRES_DB: playground
+    # wal_level=logical: required for the SHADOW_TABLE/EXPAND_BACKFILL
+    # machinery this demo's own ALTER COLUMN TYPE runs through — matches
+    # this repo's own deploy/docker-compose.dev.yml pg-logical service.
+    command: ["postgres", "-c", "wal_level=logical"]
+    volumes:
+      - ./init-seed.sql:/docker-entrypoint-initdb.d/init-seed.sql:ro
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pgarchimigrator -d playground"]
+      # A generous interval/retries budget — the healthcheck itself
+      # doesn't gate on the 5M-row seed finishing (pg_isready only
+      # confirms the server accepts connections, not that
+      # /docker-entrypoint-initdb.d has completed; postgres's own
+      # entrypoint won't accept connections at all until every
+      # initdb.d script finishes, so a passing healthcheck here IS a
+      # reliable signal seeding is done, without this compose file
+      # needing to poll the table's own row count separately).
+      interval: 3s
+      timeout: 5s
+      retries: 60
+
+  # One-shot: this published image runs as the distroless "nonroot"
+  # image user (UID/GID 65532 — Google's distroless :nonroot images
+  # always use this fixed value, not something this Dockerfile
+  # assigns itself), and the pgarchimigrator-data named volume below
+  # starts out root-owned (Docker's own default for a fresh named
+  # volume) — without this step, the bootstrap/pgarchimigrator
+  # services below would get a permission-denied writing their own
+  # state/auth databases into it. A plain busybox image (root by
+  # default) chowns it once, then exits.
+  volume-init:
+    image: busybox:1.36
+    command: ["chown", "-R", "65532:65532", "/data"]
+    volumes:
+      - pgarchimigrator-data:/data
+
+  # Creates the playground's own admin login automatically — see
+  # playground/README.md for the resulting email/password — so
+  # opening the dashboard for the first time goes straight to signed-
+  # in, not a signup wizard. Real credentials, not a shortcut around
+  # real auth: this runs the exact same `auth create-admin` command
+  # this repo's own README documents for a normal deployment.
+  bootstrap:
+    image: ghcr.io/pgarchihub/pgarchimigrator:latest
+    command:
+      - "auth"
+      - "create-admin"
+      - "--auth-db"
+      - "/data/pgarchimigrator-auth.db"
+      - "--email"
+      - "admin@example.com"
+      - "--password"
+      - "playground123"
+      - "--org"
+      - "Playground"
+    volumes:
+      - pgarchimigrator-data:/data
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+
+  pgarchimigrator:
+    image: ghcr.io/pgarchihub/pgarchimigrator:latest
+    environment:
+      # Pre-fills the New Migration form's own source connection —
+      # matches the "orders" table init-seed.sql creates in the "pg"
+      # service above.
+      PGARCHIMIGRATOR_DATABASE_URL: "postgresql://pgarchimigrator:pgarchimigrator_playground_only@pg:5432/playground?sslmode=disable"
+    ports:
+      - "8080:8080"
+    volumes:
+      - pgarchimigrator-data:/data
+    depends_on:
+      pg:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+
+volumes:
+  pgarchimigrator-data:
