@@ -33,18 +33,25 @@ services:
     ports:
       - "55432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pgarchimigrator -d playground"]
-      # A generous interval/retries budget — the healthcheck itself
-      # doesn't gate on the 5M-row seed finishing (pg_isready only
-      # confirms the server accepts connections, not that
-      # /docker-entrypoint-initdb.d has completed; postgres's own
-      # entrypoint won't accept connections at all until every
-      # initdb.d script finishes, so a passing healthcheck here IS a
-      # reliable signal seeding is done, without this compose file
-      # needing to poll the table's own row count separately).
+      # -h 127.0.0.1 is load-bearing, not decoration — a bare
+      # `pg_isready` (no host) connects over the Unix socket, and
+      # postgres's own docker-entrypoint runs a TEMPORARY server on
+      # exactly that socket (listen_addresses='') while
+      # /docker-entrypoint-initdb.d scripts run, before the real,
+      # TCP-listening server ever starts. This repo's own first version
+      # of this healthcheck omitted -h and, as a result, reported
+      # "healthy" while this file's own 5,000,000-row seed was still
+      # mid-INSERT (an uncommitted transaction, invisible to any other
+      # session) — confirmed via this repo's real CI, which saw
+      # `docker compose up --wait` succeed in ~12s while a separate
+      # query moments later saw 0 rows. Forcing TCP here means this
+      # healthcheck can only pass once the REAL server is listening,
+      # which only happens after every initdb.d script — including the
+      # seed — has actually finished.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U pgarchimigrator -d playground"]
       interval: 3s
       timeout: 5s
-      retries: 60
+      retries: 120
 
   # One-shot: this published image runs as the distroless "nonroot"
   # image user (UID/GID 65532 — Google's distroless :nonroot images
