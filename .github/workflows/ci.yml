@@ -319,7 +319,12 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{"table":"orders","operation":"ALTER_COLUMN_TYPE","column":"id","type":"bigint","actor":"playground-ci"}')
           echo "start response: $RESPONSE"
-          JOB_ID=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])" 2>/dev/null || echo "")
+          # 'JobID' (capital, matching progress.Report's own Go field
+          # name — the start-migration response is that same struct,
+          # confirmed via this repo's real CI: the actual response
+          # body was 'JobID':'job-...', not 'id') — a first guess at
+          # 'id' here was wrong and never would have worked.
+          JOB_ID=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['JobID'])" 2>/dev/null || echo "")
           if [ -z "$JOB_ID" ]; then
             echo "could not extract a job id from the start-migration response"
             exit 1
