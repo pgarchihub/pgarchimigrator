@@ -281,6 +281,7 @@ jobs:
       - name: docker compose up (timed)
         working-directory: playground
         run: |
+          exec > >(tee /tmp/compose-up-output.txt) 2>&1
           START=$(date +%s)
           docker compose up -d --wait
           END=$(date +%s)
@@ -375,7 +376,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          docker compose logs > /tmp/playground-logs.txt 2>&1
+          {
+            echo "=== docker compose up output (if it ran) ==="
+            cat /tmp/compose-up-output.txt 2>/dev/null || echo "(no compose-up output file)"
+            echo ""
+            echo "=== docker compose logs ==="
+            docker compose logs 2>&1
+          } > /tmp/playground-logs.txt
           tail -c 60000 /tmp/playground-logs.txt > /tmp/playground-logs-trimmed.txt
           python3 -c "import json; logs = open('/tmp/playground-logs-trimmed.txt').read(); json.dump({'body': '## playground-smoke failure logs\n\n' + chr(96)*3 + '\n' + logs + '\n' + chr(96)*3}, open('/tmp/playground-comment.json', 'w'))"
           curl -s -X POST \
