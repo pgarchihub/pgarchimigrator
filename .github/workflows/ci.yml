@@ -466,3 +466,97 @@ jobs:
         if: always()
         working-directory: playground
         run: docker compose down -v
+
+  # --- Benchmark: real, measured cmd/loadtest output for README.md -------
+  benchmark:
+    name: Benchmark / real cmd/loadtest measurement
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # needed for the commit-comment steps below
+    # Real, measured p50/p95/p99 application-query latency before,
+    # during, and after a real EXPAND_BACKFILL migration against a real
+    # 5,000,000-row table — this repo's own README.md's "Benchmark"
+    # section quotes this job's own real output, not invented numbers.
+    # cmd/loadtest is this repo's own existing tool for exactly this
+    # (talks to the real REST API like any external client — see its
+    # own doc comment in cmd/loadtest/main.go), not something built new
+    # for this job.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Start test PostgreSQL (pg-logical)
+        run: docker compose -f deploy/docker-compose.dev.yml up -d pg-logical
+
+      - name: Wait for pg-logical to accept connections
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose -f deploy/docker-compose.dev.yml exec -T pg-logical pg_isready -U pgarchimigrator > /dev/null 2>&1; then
+              echo "pg-logical ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "pg-logical never became ready"
+          exit 1
+
+      - name: Bootstrap admin + start the server
+        env:
+          PGARCHIMIGRATOR_DATABASE_URL: "postgresql://pgarchimigrator:pgarchimigrator_dev_only@localhost:55432/pgarchimigrator_test?sslmode=disable"
+        run: |
+          go run ./cmd/pgarchimigrator auth create-admin --email admin@example.com --password benchmark-only-password
+          nohup go run ./cmd/pgarchimigrator serve > /tmp/server-output.txt 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/api/setup-required > /dev/null 2>&1; then
+              echo "server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server never became ready"
+          cat /tmp/server-output.txt
+          exit 1
+
+      - name: Generate the benchmark table (5,000,000 rows — same scale as playground/)
+        run: |
+          exec > >(tee /tmp/benchmark-generate-output.txt) 2>&1
+          go run ./cmd/loadtest generate \
+            --dsn "postgresql://pgarchimigrator:pgarchimigrator_dev_only@localhost:55432/pgarchimigrator_test?sslmode=disable" \
+            --rows 5000000
+
+      - name: Run the real benchmark (ADD_COLUMN with a volatile default — exercises EXPAND_BACKFILL, not the metadata-only fast path)
+        run: |
+          exec > >(tee /tmp/benchmark-run-output.txt) 2>&1
+          go run ./cmd/loadtest run \
+            --dsn "postgresql://pgarchimigrator:pgarchimigrator_dev_only@localhost:55432/pgarchimigrator_test?sslmode=disable" \
+            --api-url "http://localhost:8080" \
+            --admin-email admin@example.com --admin-password benchmark-only-password \
+            --operation ADD_COLUMN --column loadtest_created_ts --column-type timestamptz \
+            --default "now()" --volatile-default
+
+      - name: Post real benchmark output as a commit comment (always)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "=== loadtest generate output ==="
+            cat /tmp/benchmark-generate-output.txt 2>/dev/null || echo "(not available)"
+            echo ""
+            echo "=== loadtest run output (the real benchmark) ==="
+            cat /tmp/benchmark-run-output.txt 2>/dev/null || echo "(not available)"
+          } > /tmp/benchmark-combined.txt
+          tail -c 60000 /tmp/benchmark-combined.txt > /tmp/benchmark-trimmed.txt
+          python3 -c "import json; logs = open('/tmp/benchmark-trimmed.txt').read(); json.dump({'body': '## Real cmd/loadtest benchmark output\n\n' + chr(96)*3 + '\n' + logs + '\n' + chr(96)*3}, open('/tmp/benchmark-comment.json', 'w'))"
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+            -d @/tmp/benchmark-comment.json
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/docker-compose.dev.yml down -v
