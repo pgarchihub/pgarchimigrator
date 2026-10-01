@@ -10,16 +10,39 @@ This is the **Community Edition** — part of the
 [pgArchiHub](https://pgarchihub.com) product family, developed by
 ArchiOrbit Labs.
 
-A CLI/service tool for zero-downtime schema changes on PostgreSQL — 12
-operation types (`ADD_COLUMN`, `DROP_COLUMN`, `ALTER_COLUMN_TYPE`,
-`ADD_INDEX`, `DROP_INDEX`, `SET_NOT_NULL`, `ADD_CONSTRAINT`,
-`RENAME_COLUMN`, `RENAME_TABLE`, `ADD_FOREIGN_KEY`,
-`ADD_GENERATED_COLUMN`, `PARTITION_TABLE`), each routed automatically to
-the cheapest safe strategy (Direct DDL / Expand & Backfill / Shadow
-Table), with dry-run previews, role-based auth, and a web dashboard.
-Originally scaffolded to mirror this project's own internal
-Architecture Design Document one-to-one; that mapping below is still
-accurate for the backend's package layout.
+## ⚡ The Problem
+
+A plain `ALTER TABLE ... ADD COLUMN ... DEFAULT <volatile expression>`,
+or an incompatible `ALTER COLUMN ... TYPE`, on a large production
+table takes an `ACCESS EXCLUSIVE` lock for as long as the rewrite
+takes — every read and write queues up behind it for the full
+duration. Generic ETL/dump-and-restore tools solve a different
+problem (moving data between systems) and don't address this at all.
+
+pgArchiMigrator routes every one of its 12 supported operation types
+to the cheapest strategy that's actually safe for the table in front
+of it — a metadata-only DDL statement when that's genuinely all it
+takes, a batched background backfill when it isn't, or a shadow
+table synced via PostgreSQL's own native logical replication when
+the change is too disruptive for either of those. Which strategy
+applies to which operation, and why, is in
+"Key Capabilities" below — not a marketing
+name, the actual decision table this project's own code implements.
+
+## 🚀 Quick Demo
+
+Try the real thing against a real 5,000,000-row table — one command,
+no manual setup, a real zero-downtime `ALTER COLUMN TYPE` you can
+watch complete:
+
+```bash
+git clone https://github.com/pgarchihub/pgarchimigrator.git
+cd pgarchimigrator/playground
+docker compose up -d --wait
+```
+
+Full walkthrough (login, what to click, real measured timing on a
+shared CI runner) in [`playground/README.md`](playground/README.md).
 
 ## Screenshots
 
@@ -42,6 +65,67 @@ replication. Cutover stays a separate, deliberate step you take
 yourself.
 
 ![Database migration detail](docs/images/pgArchiMigrator_03_Database_Migration_Detail.png)
+
+## 📊 Benchmark
+
+Real measured output from this repository's own `cmd/loadtest` tool
+(application-query latency measured through the real REST API, not a
+synthetic number) — see this project's own CI
+(`.github/workflows/ci.yml`'s `benchmark` job) for how this is
+re-measured on every push, not written once and left to go stale.
+`ADD_COLUMN` with a volatile default against a real 5,000,000-row
+table, specifically chosen to exercise `EXPAND_BACKFILL`'s batched-write
+path rather than the metadata-only fast path most schema changes
+actually take:
+
+```
+Strategy used: EXPAND_BACKFILL
+
+BEFORE/AFTER migration (baseline) (421,636 queries, 0 errors):
+  p50=3ms  p95=3ms  p99=4ms  max=242ms
+DURING migration (622,214 queries, 0 errors):
+  p50=4ms  p95=5ms  p99=6ms  max=471ms
+
+p99 latency during the migration was 1.5x the baseline p99.
+=> Looks like a genuinely low-impact migration.
+```
+
+Measured on GitHub Actions' own standard 2-vCPU runner — modest,
+shared hardware, not a tuned benchmark machine. Run it yourself
+against your own table shape and hardware: see ["Load testing"](#load-testing)
+below.
+
+## 🛠️ Key Capabilities
+
+- **12 operation types** — `ADD_COLUMN`, `DROP_COLUMN`,
+  `ALTER_COLUMN_TYPE`, `ADD_INDEX`, `DROP_INDEX`, `SET_NOT_NULL`,
+  `ADD_CONSTRAINT`, `RENAME_COLUMN`, `RENAME_TABLE`,
+  `ADD_FOREIGN_KEY`, `ADD_GENERATED_COLUMN`, `PARTITION_TABLE`.
+- **Automatic strategy selection** — every operation routes to
+  **Direct DDL** (metadata-only, when the change genuinely is that
+  cheap), **Expand & Backfill** (a new column/constraint added
+  alongside the old, backfilled in batches, then swapped in), or
+  **Shadow Table** (a full copy kept in sync via PostgreSQL's own
+  logical replication, for the most disruptive changes — e.g. an
+  incompatible `ALTER_COLUMN_TYPE`, or `PARTITION_TABLE`, which always
+  uses this strategy regardless of table size) — see
+  `internal/strategy` for the actual decision logic, not a
+  simplification of it.
+- **Backward-compatible by default where it matters** —
+  `RENAME_TABLE` leaves a real, auto-updatable view under the old
+  name; `RENAME_COLUMN` dual-writes both names during its own
+  transition window; `DROP_COLUMN` defers the physical drop until
+  its own rollback window closes, so a caller still using the
+  original name is never broken mid-migration.
+- **Dry-run previews** — strategy + the exact SQL that would run +
+  read-only pre-flight warnings, no database writes
+  (`internal/engines/postgresql/preview`).
+- **Role-based auth and a full audit log** — every migration records
+  who ran it (`internal/auth`, `internal/auditlog`).
+- **A rollback window, not just a rollback button** — `SHADOW_TABLE`
+  migrations keep the pre-migration table reachable for a real
+  window after cutover, not just a point of no return the instant the
+  swap finishes.
 
 ## Supported PostgreSQL Versions
 
@@ -86,7 +170,9 @@ not just documented as "should work."
 | `internal/api` | 5 | REST API + embedded web dashboard |
 | `web/` | 5 ("Basit Web UI") | React SPA dashboard — built separately, embedded into the Go binary (see below) |
 
-## Quick Start (Install Script)
+## 📦 Installation
+
+### Install Script
 
 Prefer a native binary over Docker? One line downloads the right
 portable package for your OS/architecture, verifies its checksum, and
@@ -115,7 +201,7 @@ Supported platforms today: Linux (x64/arm64), macOS (Apple Silicon
 only — Intel isn't published yet), Windows (x64). See
 `deploy/platforms/` for the exact matrix.
 
-## Quick Start (Docker)
+### Docker
 
 The fastest way to try this out — no CLI bootstrapping required, the
 web UI walks you through creating the first admin account on first
@@ -134,6 +220,9 @@ admin account" screen (see `internal/api`'s `handleSetup`), not a bare
 login form. The `-v pgarchimigrator-data:/data` volume is important: it's where
 the SQLite state/auth databases live, and without it every container
 restart loses all users and migration history.
+
+(Want to see it working against real data first, with zero
+configuration? See "Quick Demo" above instead.)
 
 ## Setup (local development)
 
@@ -192,6 +281,11 @@ Every push and pull request runs the exact same checks above automatically
 - **Deployment / Docker build + Helm lint** — the full multi-stage Docker
   build (including the frontend build stage) and `helm lint` /
   `helm template` against the chart
+- **Playground** — the real `docker compose up` demo in
+  [`playground/`](playground/README.md), run end to end against the
+  real published Docker image
+- **Benchmark** — the real `cmd/loadtest` measurement quoted above,
+  re-run on every push
 
 Nothing here needs configuring beyond what's already in the workflow file
 — no secrets, no external services beyond the ephemeral Postgres
@@ -201,7 +295,9 @@ containers the job itself starts and tears down.
 
 `cmd/loadtest` is a standalone tool (talks to the REST API like any
 external client — no `internal/` import) for measuring whether a
-migration actually stays low-impact at scale:
+migration actually stays low-impact at scale — the same tool behind
+the "Benchmark" numbers above, which you can reproduce
+or re-run against your own table shape:
 
 ```bash
 # 1. Generate a large test table (defaults to 10M rows)
@@ -254,14 +350,16 @@ The target table needs a PRIMARY KEY for `SHADOW_TABLE` specifically
 (unlike `DIRECT_DDL`/`EXPAND_BACKFILL`) — `loadtest generate`'s table
 already has one (`id BIGSERIAL PRIMARY KEY`).
 
-## Contributing
+## 🤝 Community & Support
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to run this locally and
-what to know before opening a pull request. Found a security issue?
-Please see [`SECURITY.md`](SECURITY.md) instead of opening a public
-issue.
+- **Docs & architecture**: [pgarchihub.com](https://pgarchihub.com)
+- **Contributing**: see [`CONTRIBUTING.md`](CONTRIBUTING.md) for how
+  to run this locally and what to know before opening a pull request
+- **Found a bug or have a question?** Open a
+  [GitHub Issue](https://github.com/pgarchihub/pgarchimigrator/issues)
+- **Found a security issue?** See [`SECURITY.md`](SECURITY.md)
+  instead of opening a public issue
 
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
-
