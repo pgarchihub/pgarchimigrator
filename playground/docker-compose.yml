@@ -1,9 +1,18 @@
-# pgArchiMigrator Community — 90-second playground
+# pgArchiMigrator Community — playground
 # =============================================================================
 # One command, one real scenario: watch a zero-downtime ALTER COLUMN TYPE
 # (orders.id: integer -> bigint — the single most common real-world reason
 # teams reach for this: running out of int32 room on a primary key) run
 # against a pre-seeded 5,000,000-row table.
+#
+# Real measured timing (this repo's own CI, GitHub Actions' standard
+# 2-vCPU runner — see playground/README.md's own "Timing" section):
+# ~30s to bring the environment up (image pull + the 5M-row seed), then
+# a few minutes for the migration itself (SHADOW_TABLE's own Initial
+# Sync, batched at 10,000 rows/batch — not configurable via this
+# product's own API, only its source). Real hardware will vary; this
+# is a demo of the mechanism working correctly end to end on real data
+# volume, not a speed benchmark.
 #
 #   docker compose up -d
 #

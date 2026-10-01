@@ -28,9 +28,12 @@ published).
 - **`playground/`** — a self-contained `docker compose up` demo: a
   pre-seeded 5,000,000-row table and a real zero-downtime `ALTER
   COLUMN TYPE` (`id`: `integer` → `bigint`, the single most common
-  real-world reason teams reach for this) you can watch complete in
-  well under a minute, with no manual setup (an admin login is created
-  automatically). See `playground/README.md`.
+  real-world reason teams reach for this) with no manual setup (an
+  admin login is created automatically). Real measured timing on
+  GitHub Actions' own standard runner: well under a minute to bring
+  the environment up, several minutes for the migration itself on 5M
+  rows (real hardware will vary — see `playground/README.md`'s own
+  "Timing" section).
 
 ## Fixed
 

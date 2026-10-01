@@ -251,22 +251,34 @@ jobs:
             exit 1
           }
 
-  # --- Playground: the "90-second" Community demo ------------------------
+  # --- Playground: the Community demo -------------------------------------
   playground-smoke:
     name: Playground / real timing measurement + zero-downtime demo
     runs-on: ubuntu-latest
     # Real, measured verification that playground/docker-compose.yml
-    # actually works end to end and that the "90 seconds" framing holds
-    # up — this sandbox this repo is developed in has no docker daemon,
-    # so this job is the only place any of this is verified for real
-    # rather than by careful reading alone (same constraint and same
-    # commit-comment log-capture pattern already established in
-    # pgarchimigrator-enterprise's own testenv-smoke job).
+    # actually works end to end, and real measured timing (see this
+    # job's own "Report real measured timing" / "Post real measured
+    # timing..." steps below) — this sandbox this repo is developed in
+    # has no docker daemon, so this job is the only place any of this
+    # is verified for real rather than by careful reading alone (same
+    # constraint and same commit-comment log-capture pattern already
+    # established in pgarchimigrator-enterprise's own testenv-smoke
+    # job).
     #
-    # "90 seconds" is measured to the SWAPPING phase completing — the
-    # actual zero-downtime moment (orders.id genuinely becomes bigint,
-    # live) — not to the job's own terminal COMPLETED state, which only
-    # arrives after FR-08a's own 10-minute ROLLBACK_WINDOW safety period
+    # This demo was originally framed as "90 seconds" before it had
+    # ever actually been run — the first real measurement (this job's
+    # own commit-comment history) showed ~28s to bring the environment
+    # up, then several minutes (not ~60s) for the migration itself on
+    # 5M rows, on GitHub Actions' own standard 2-vCPU runner. Kept at
+    # 5M rows deliberately (a smaller table would hide whether this
+    # genuinely works at real data volume) with the timing claim
+    # corrected to match, rather than shrinking the table to chase a
+    # number decided before anything was measured.
+    #
+    # Measured to the SWAPPING phase completing — the actual zero-
+    # downtime moment (orders.id genuinely becomes bigint, live) — not
+    # to the job's own terminal COMPLETED state, which only arrives
+    # after FR-08a's own 10-minute ROLLBACK_WINDOW safety period
     # (internal/engines/postgresql/shadowflow's own defaultRollbackWindow,
     # not configurable via any env var or flag — verified by reading
     # that package, not assumed). That 10-minute window is a real,
