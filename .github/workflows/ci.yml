@@ -382,6 +382,38 @@ jobs:
           echo "- docker compose up (incl. 5M-row seed): ${COMPOSE_UP_SECONDS}s" >> "$GITHUB_STEP_SUMMARY"
           echo "- login + start migration + reach zero-downtime swap: ${MIGRATION_SECONDS}s" >> "$GITHUB_STEP_SUMMARY"
           echo "- total: ${TOTAL}s" >> "$GITHUB_STEP_SUMMARY"
+          echo "TIMING_TOTAL_SECONDS=$TOTAL" >> "$GITHUB_ENV"
+
+      - name: Post real measured timing as a commit comment (always, not just on failure)
+        # $GITHUB_STEP_SUMMARY above is only ever visible in the
+        # Actions web UI — no REST API exposes it, so (same constraint
+        # as this job's own step logs, documented elsewhere in this
+        # workflow) it's unreachable from this repo's own development
+        # sandbox. Posting the same numbers here, through the one
+        # channel (commit comments via api.github.com) that sandbox
+        # CAN reach, makes real measured timing checkable later by
+        # anyone, not just visible once in the UI at run time.
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${COMPOSE_UP_SECONDS:-}" ] && [ -n "${MIGRATION_SECONDS:-}" ]; then
+            {
+              echo "## Playground real measured timing"
+              echo ""
+              echo "- docker compose up (incl. 5M-row seed): ${COMPOSE_UP_SECONDS}s"
+              echo "- login + start migration + reach zero-downtime swap: ${MIGRATION_SECONDS}s"
+              echo "- **total: ${TIMING_TOTAL_SECONDS}s**"
+            } > /tmp/timing-body.txt
+          else
+            printf '## Playground real measured timing\n\nNot available — this run did not reach both timed steps.\n' > /tmp/timing-body.txt
+          fi
+          python3 -c "import json; json.dump({'body': open('/tmp/timing-body.txt').read()}, open('/tmp/timing-comment.json', 'w'))"
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+            -d @/tmp/timing-comment.json
 
       - name: Dump logs and post as a commit comment on failure
         if: failure()
